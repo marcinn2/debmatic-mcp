@@ -7,6 +7,9 @@ COPY src/ ./src/
 RUN npx tsc
 
 FROM node:22-alpine
+LABEL org.opencontainers.image.source="https://github.com/marcinn2/debmatic-mcp" \
+      org.opencontainers.image.description="MCP server for controlling HomeMatic smart home devices via the CCU JSON-RPC API" \
+      org.opencontainers.image.licenses="MIT"
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev

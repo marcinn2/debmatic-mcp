@@ -44,26 +44,60 @@ async function main(): Promise<void> {
     logger.error("cache_warm_background_error", { error: (err as Error).message });
   });
 
-  // Create resolver and MCP server
+  // Create resolver and shared deps for MCP servers
   const resolver = new Resolver();
-  const mcpServer = createMcpServer({ config, session, rateLimiter, logger, deviceTypeCache, resolver });
-
-  // Start resource poller
-  const poller = new ResourcePoller(mcpServer.server, session, rateLimiter, logger, config.resourcePollInterval);
+  const serverDeps = { config, session, rateLimiter, logger, deviceTypeCache, resolver };
 
   // Connect transport
   if (config.mcp.transport === "stdio") {
+    const mcpServer = createMcpServer(serverDeps);
+    const poller = new ResourcePoller(mcpServer.server, session, rateLimiter, logger, config.resourcePollInterval);
     const transport = new StdioServerTransport();
     await mcpServer.connect(transport);
     poller.start();
     logger.info("server_ready", { transport: "stdio" });
+
+    // Graceful shutdown with re-entrancy guard
+    let shuttingDown = false;
+    const shutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      logger.info("shutdown", { signal });
+
+      const forceExit = setTimeout(() => process.exit(1), 10_000);
+      forceExit.unref();
+
+      try {
+        poller.stop();
+        rateLimiter.destroy();
+        await deviceTypeCache.saveToDisk();
+        await session.logout();
+        session.destroy();
+        await mcpServer.close();
+      } catch (err) {
+        logger.error("shutdown_error", { error: (err as Error).message });
+      }
+      process.exit(0);
+    };
+
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGINT", () => shutdown("SIGINT"));
   } else {
-    // HTTP mode with auth
+    // HTTP mode: fresh transport + server per request (stateless, SDK 1.28+ requirement)
     const authToken = await resolveAuthToken(config.mcp.authToken, config.cache.dir, logger);
 
-    const httpTransport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-
     const httpServer = createServer(async (req, res) => {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+      res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+
+      if (req.method === "OPTIONS") {
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+
       // Health check endpoint
       if (req.url === "/health" && req.method === "GET") {
         handleHealthRequest(req, res, { session, deviceTypeCache });
@@ -83,44 +117,42 @@ async function main(): Promise<void> {
         return;
       }
 
-      // Delegate to MCP transport
-      await httpTransport.handleRequest(req, res);
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+      const mcpServer = createMcpServer(serverDeps);
+      await mcpServer.connect(transport);
+      await transport.handleRequest(req, res);
+      await mcpServer.close();
     });
-
-    await mcpServer.connect(httpTransport);
-    poller.start();
 
     httpServer.listen(config.mcp.port, () => {
       logger.info("server_ready", { transport: "http", port: config.mcp.port });
     });
+
+    // Graceful shutdown with re-entrancy guard
+    let shuttingDown = false;
+    const shutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      logger.info("shutdown", { signal });
+
+      const forceExit = setTimeout(() => process.exit(1), 10_000);
+      forceExit.unref();
+
+      try {
+        rateLimiter.destroy();
+        await deviceTypeCache.saveToDisk();
+        await session.logout();
+        session.destroy();
+        httpServer.close();
+      } catch (err) {
+        logger.error("shutdown_error", { error: (err as Error).message });
+      }
+      process.exit(0);
+    };
+
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGINT", () => shutdown("SIGINT"));
   }
-
-  // Graceful shutdown with re-entrancy guard
-  let shuttingDown = false;
-  const shutdown = async (signal: string) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    logger.info("shutdown", { signal });
-
-    // Safety net: force exit after 10s if graceful shutdown hangs
-    const forceExit = setTimeout(() => process.exit(1), 10_000);
-    forceExit.unref();
-
-    try {
-      poller.stop();
-      rateLimiter.destroy();
-      await deviceTypeCache.saveToDisk();
-      await session.logout();
-      session.destroy();
-      await mcpServer.close();
-    } catch (err) {
-      logger.error("shutdown_error", { error: (err as Error).message });
-    }
-    process.exit(0);
-  };
-
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 main().catch((err) => {

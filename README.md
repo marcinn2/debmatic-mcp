@@ -201,6 +201,33 @@ This has been tested against a production debmatic installation with:
 
 Other device types should work too — the server queries the CCU for parameter descriptions rather than maintaining a static device database.
 
+## Changes by @marcinn2
+
+### Fixes for MCP SDK 1.28+ compatibility
+
+**Problem:** `@modelcontextprotocol/sdk` 1.28.0 added a guard that prevents a stateless `StreamableHTTPServerTransport` from being reused across requests. The original code created one transport at startup and reused it for all incoming requests, causing every request after the first to fail with `Error: Stateless transport cannot be reused across requests`.
+
+**Fix:** In HTTP mode the server now creates a fresh `StreamableHTTPServerTransport` and a fresh `McpServer` instance per request. Shared state (CCU session, rate limiter, device type cache, resolver) is still initialized once at startup and passed into each per-request server — so there is no performance regression for the CCU calls themselves.
+
+The resource poller (used for live resource subscription push in stdio mode) is intentionally not started in HTTP mode, as stateless HTTP connections have no persistent channel to receive push notifications.
+
+### CORS support for browser-based MCP clients
+
+The HTTP server now sets the required CORS headers on every response and handles `OPTIONS` preflight requests. This allows browser-based MCP clients such as [MCP Inspector](https://github.com/modelcontextprotocol/inspector) to connect directly without a proxy.
+
+### Dependency updates
+
+All dependencies updated to current latest versions:
+
+| Package | Before | After |
+|---------|--------|-------|
+| `@modelcontextprotocol/sdk` | `^1.28.0` | `^1.29.0` |
+| `undici` | `^7.24.6` | `^8.3.0` |
+| `zod` | `^3.25 \|\| ^4.0` | `^4.4.3` |
+| `@types/node` | `^25.5.0` | `^25.9.1` |
+| `typescript` | `^6.0.2` | `^6.0.3` |
+| `vitest` | `^4.1.2` | `^4.1.7` |
+
 ## Related projects
 
 - [debmatic](https://github.com/alexreinert/debmatic) — Run HomeMatic on Debian, Ubuntu, Raspberry Pi OS, Armbian
