@@ -19,10 +19,11 @@
     "start:stdio": "node dist/index.js --stdio",
     "start:http": "node dist/index.js --http",
     "dev": "tsc --watch",
+    "pretest": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "prepublishOnly": "npm run lint && npm test && npm run build"
+    "prepublishOnly": "npm run lint && npm test"
   },
   "engines": {
     "node": ">=22"
