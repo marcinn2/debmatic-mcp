@@ -1,5 +1,20 @@
 import { describe, it, expect } from "vitest";
-import { parseValue, parseValues } from "../../src/utils.js";
+import { escapeHmScript, parseValue, parseValues } from "../../src/utils.js";
+
+describe("escapeHmScript", () => {
+  // Escape semantics verified against a live CCU (issue #16):
+  // \\ \" \n \r are real ReGa escapes; # must NOT be escaped (ReGa keeps
+  // the backslash, corrupting the value).
+  it("escapes backslash, quote, and newlines", () => {
+    expect(escapeHmScript('a"b')).toBe('a\\"b');
+    expect(escapeHmScript("a\\b")).toBe("a\\\\b");
+    expect(escapeHmScript("a\nb\rc")).toBe("a\\nb\\rc");
+  });
+
+  it("leaves # untouched", () => {
+    expect(escapeHmScript("a#b")).toBe("a#b");
+  });
+});
 
 describe("parseValue", () => {
   it("converts CCU float strings to numbers", () => {

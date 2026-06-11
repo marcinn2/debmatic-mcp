@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import type { SessionManager } from "../ccu/session.js";
 import type { RateLimiter } from "../middleware/rate-limiter.js";
 import type { Logger } from "../logger.js";
@@ -32,7 +31,9 @@ export class ResourcePoller {
   private consecutiveFailures = 0;
 
   constructor(
-    private readonly server: Server,
+    // Called when a polled resource changed. In stdio mode this notifies the
+    // single server; in HTTP mode it fans out to all active MCP sessions.
+    private readonly notifyChanged: () => Promise<void>,
     private readonly session: SessionManager,
     private readonly rateLimiter: RateLimiter,
     private readonly logger: Logger,
@@ -103,7 +104,11 @@ export class ResourcePoller {
     }
 
     if (anyChanged) {
-      await this.server.sendResourceListChanged();
+      try {
+        await this.notifyChanged();
+      } catch (err) {
+        this.logger.warn("resource_notify_failed", { error: (err as Error).message });
+      }
     }
   }
 }

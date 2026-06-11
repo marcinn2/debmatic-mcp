@@ -4,12 +4,15 @@ const _require = createRequire(import.meta.url);
 /** Server version — read from package.json at runtime, single source of truth. */
 export const VERSION: string = (_require("../package.json") as { version: string }).version;
 
-/** Escape a string for safe interpolation into HomeMatic Script double-quoted strings. */
+/**
+ * Escape a string for safe interpolation into HomeMatic Script double-quoted strings.
+ * Verified against a live CCU (issue #16): \\ \" \n are real ReGa escapes; # needs
+ * no escaping inside string literals — `\#` keeps the backslash and corrupts the value.
+ */
 export function escapeHmScript(input: string): string {
   return input
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
-    .replace(/#/g, "\\#")
     .replace(/\n/g, "\\n")
     .replace(/\r/g, "\\r");
 }
