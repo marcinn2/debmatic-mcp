@@ -144,7 +144,14 @@ function registerPutParamset(server: McpServer, deps: ServerDeps): void {
   );
 }
 
+const SYSVAR_TYPE_TTL_MS = 30_000;
+
 function registerSetSystemVariable(server: McpServer, deps: ServerDeps): void {
+  // Short-lived name→type cache: avoids fetching the full sysvar list on every
+  // write. Types virtually never change; a fresh-cache miss still refetches,
+  // so newly created variables are picked up immediately.
+  let typeCache: { ts: number; types: Map<string, string> } | null = null;
+
   server.registerTool(
     "set_system_variable",
     {
@@ -165,18 +172,25 @@ function registerSetSystemVariable(server: McpServer, deps: ServerDeps): void {
       const start = Date.now();
 
       try {
-        // Look up variable type from CCU to choose correct setter
+        // Look up variable type (cached) to choose correct setter
         let method: string;
-        await rateLimiter.acquire();
-        const allVars = await withRetry(
-          () => session.call("SysVar.getAll"),
-          "SysVar.getAll",
-          logger,
-        ) as Array<{ name: string; type: string }>;
+        let sysVarType: string | undefined;
+        if (typeCache && Date.now() - typeCache.ts < SYSVAR_TYPE_TTL_MS) {
+          sysVarType = typeCache.types.get(args.name);
+        }
+        if (sysVarType === undefined) {
+          await rateLimiter.acquire();
+          const allVars = await withRetry(
+            () => session.call("SysVar.getAll"),
+            "SysVar.getAll",
+            logger,
+          ) as Array<{ name: string; type: string }>;
+          typeCache = { ts: Date.now(), types: new Map(allVars.map((v) => [v.name, v.type])) };
+          sysVarType = typeCache.types.get(args.name);
+        }
 
-        const sysVar = allVars.find((v) => v.name === args.name);
-        if (sysVar) {
-          const varType = sysVar.type.toUpperCase();
+        if (sysVarType !== undefined) {
+          const varType = sysVarType.toUpperCase();
           if (varType.includes("BOOL") || varType.includes("ALARM")) {
             method = "SysVar.setBool";
           } else if (varType.includes("FLOAT") || varType.includes("NUMBER") || varType.includes("INTEGER")) {
@@ -198,11 +212,11 @@ function registerSetSystemVariable(server: McpServer, deps: ServerDeps): void {
             logger.info("tool_call", { tool: "set_system_variable", duration_ms: Date.now() - start, status: "ok" });
             return toolResult({ name: args.name, value: args.value, method: "ReGa.runScript (string)" });
           } else {
-            logger.warn("sysvar_unknown_type", { name: args.name, type: sysVar.type });
+            logger.warn("sysvar_unknown_type", { name: args.name, type: sysVarType });
             throw new CcuError({
               error: "INVALID_INPUT",
               code: 0,
-              message: `System variable "${args.name}" has unsupported type: ${sysVar.type}`,
+              message: `System variable "${args.name}" has unsupported type: ${sysVarType}`,
               hint: "Supported types are bool/alarm, float/integer, enum/list, and string.",
             });
           }

@@ -129,6 +129,58 @@ describe("DeviceTypeCache", () => {
     expect(files).not.toContain("device-type-cache.json.tmp");
   });
 
+  // Regression: concurrent live queries for the same type were duplicated (issue #11)
+  it("coalesces concurrent queryAndCache calls for the same type", async () => {
+    const cache = new DeviceTypeCache(tempDir, 86400, logger);
+    let calls = 0;
+    const session = {
+      call: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 5));
+        return [];
+      },
+    } as any;
+    const rateLimiter = { acquire: async () => {} } as any;
+
+    const [a, b] = await Promise.all([
+      cache.queryAndCache("HmIP-X", "ADDR", "HmIP-RF", ["ADDR:1"], session, rateLimiter),
+      cache.queryAndCache("HmIP-X", "ADDR", "HmIP-RF", ["ADDR:1"], session, rateLimiter),
+    ]);
+
+    // 1 channel × 2 paramset keys = 2 CCU calls if coalesced, 4 if duplicated
+    expect(calls).toBe(2);
+    expect(a).toBe(b);
+
+    // let the fire-and-forget saveToDisk finish before afterEach removes tempDir
+    await new Promise((r) => setTimeout(r, 25));
+  });
+
+  // Issue #12: warming processes device types with bounded concurrency
+  it("warm populates the cache for all device types", async () => {
+    const cache = new DeviceTypeCache(tempDir, 86400, logger);
+    const session = {
+      call: async (method: string) => {
+        if (method === "Interface.listInterfaces") return [{ name: "HmIP-RF" }];
+        if (method === "Interface.listDevices") return [
+          { type: "HmIP-A", address: "A1", children: ["A1:1"] },
+          { type: "HmIP-B", address: "B1", children: ["B1:1"] },
+          { type: "HmIP-C", address: "C1", children: ["C1:1"] },
+          { type: "HmIP-D", address: "D1", children: ["D1:1"] },
+        ];
+        if (method === "Interface.getParamsetDescription") {
+          return [{ ID: "STATE", TYPE: "BOOL", OPERATIONS: "7" }];
+        }
+        return null;
+      },
+    } as any;
+    const rateLimiter = { acquire: async () => {} } as any;
+
+    await cache.warm(session, rateLimiter);
+
+    expect(cache.size()).toBe(4);
+    expect(cache.get("HmIP-A")!.channels["1"]!.paramsets["VALUES"]!["STATE"]!.type).toBe("BOOL");
+  });
+
   it("isWarming returns false by default", () => {
     const cache = new DeviceTypeCache(tempDir, 86400, logger);
     expect(cache.isWarming()).toBe(false);

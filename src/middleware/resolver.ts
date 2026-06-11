@@ -10,6 +10,7 @@ export class Resolver {
   private interfaceMap: Map<string, string> | null = null;
   private deviceTypeMap: Map<string, string> | null = null;
   private deviceList: CcuDevice[] | null = null;
+  private refreshPromise: Promise<void> | null = null;
 
   async resolveInterface(
     address: string,
@@ -90,7 +91,20 @@ export class Resolver {
     }
   }
 
+  /** Single-flight: concurrent cold-cache resolutions share one Device.listAllDetail. */
   private async refreshDeviceList(
+    session: SessionManager,
+    rateLimiter: RateLimiter,
+    logger: Logger,
+  ): Promise<void> {
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = this.doRefresh(session, rateLimiter, logger).finally(() => {
+      this.refreshPromise = null;
+    });
+    return this.refreshPromise;
+  }
+
+  private async doRefresh(
     session: SessionManager,
     rateLimiter: RateLimiter,
     logger: Logger,

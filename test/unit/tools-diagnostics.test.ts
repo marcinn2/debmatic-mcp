@@ -27,6 +27,26 @@ describe("get_service_messages handler", () => {
     cleanupDeps(deps);
   });
 
+  // Issue #8: single-pass script returns {alarms, channelNames}; names merged in JS
+  it("merges channel names from the single-pass script format", async () => {
+    const mock = JSON.stringify({
+      alarms: [
+        { id: "1", type: "LOWBAT", address: "ABC:0", timestamp: "2026-06-11" },
+        { id: "2", type: "UNREACH", address: "XYZ:0", timestamp: "2026-06-11" },
+      ],
+      channelNames: { "ABC:0": "Thermostat Büro" },
+    });
+    const { server, deps } = createTestServer({
+      sessionCall: vi.fn().mockResolvedValue(mock),
+    });
+
+    const result = parseToolResult(await callTool(server, "get_service_messages")) as any[];
+
+    expect(result[0].channelName).toBe("Thermostat Büro");
+    expect(result[1].channelName).toBe(""); // unresolved address → empty, not undefined
+    cleanupDeps(deps);
+  });
+
   it("returns raw string when script output is not JSON", async () => {
     const { server, deps } = createTestServer({
       sessionCall: vi.fn().mockResolvedValue("raw output"),

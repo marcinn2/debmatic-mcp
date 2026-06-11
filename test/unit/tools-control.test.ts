@@ -101,6 +101,43 @@ describe("set_system_variable handler", () => {
     cleanupDeps(deps);
   });
 
+  // Issue #10: variable types are cached for 30s — one SysVar.getAll across calls
+  it("caches sysvar types so repeated writes fetch SysVar.getAll only once", async () => {
+    const sessionCall = vi.fn().mockImplementation(async (method: string) => {
+      if (method === "SysVar.getAll") return [{ name: "Anwesenheit", type: "BOOL" }];
+      return true;
+    });
+    const { server, deps } = createTestServer({ sessionCall });
+
+    await callTool(server, "set_system_variable", { name: "Anwesenheit", value: true });
+    await callTool(server, "set_system_variable", { name: "Anwesenheit", value: false });
+
+    const getAllCalls = sessionCall.mock.calls.filter((c: unknown[]) => c[0] === "SysVar.getAll");
+    expect(getAllCalls.length).toBe(1);
+    cleanupDeps(deps);
+  });
+
+  it("refetches the sysvar list on a fresh-cache miss (new variable)", async () => {
+    let round = 0;
+    const sessionCall = vi.fn().mockImplementation(async (method: string) => {
+      if (method === "SysVar.getAll") {
+        round++;
+        return round === 1
+          ? [{ name: "Anwesenheit", type: "BOOL" }]
+          : [{ name: "Anwesenheit", type: "BOOL" }, { name: "NeueVariable", type: "FLOAT" }];
+      }
+      return true;
+    });
+    const { server, deps } = createTestServer({ sessionCall });
+
+    await callTool(server, "set_system_variable", { name: "Anwesenheit", value: true });
+    const result = parseToolResult(await callTool(server, "set_system_variable", { name: "NeueVariable", value: 1.5 }));
+
+    expect((result as any).method).toBe("SysVar.setFloat");
+    expect(round).toBe(2); // cache was fresh but missed → refetched
+    cleanupDeps(deps);
+  });
+
   it("uses SysVar.setBool for bool variables", async () => {
     const sessionCall = vi.fn()
       .mockResolvedValueOnce([{ name: "Anwesenheit", type: "BOOL" }]) // SysVar.getAll
