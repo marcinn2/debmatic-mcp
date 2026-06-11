@@ -97,7 +97,8 @@ function registerPutParamset(server: McpServer, deps: ServerDeps): void {
       inputSchema: {
         address: z.string().describe("Channel address"),
         paramsetKey: z.enum(["VALUES", "MASTER"]).describe("Paramset to write"),
-        set: z.record(z.string(), z.unknown()).describe("Key-value pairs to write (e.g. {TEMPERATURE_WINDOW_OPEN: 5.0})"),
+        set: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+          .describe("Key-value pairs to write (e.g. {TEMPERATURE_WINDOW_OPEN: 5.0})"),
         interface: z.string().optional().describe("Interface name override"),
       },
       annotations: {
@@ -143,7 +144,14 @@ function registerPutParamset(server: McpServer, deps: ServerDeps): void {
   );
 }
 
+const SYSVAR_TYPE_TTL_MS = 30_000;
+
 function registerSetSystemVariable(server: McpServer, deps: ServerDeps): void {
+  // Short-lived name→type cache: avoids fetching the full sysvar list on every
+  // write. Types virtually never change; a fresh-cache miss still refetches,
+  // so newly created variables are picked up immediately.
+  let typeCache: { ts: number; types: Map<string, string> } | null = null;
+
   server.registerTool(
     "set_system_variable",
     {
@@ -164,18 +172,25 @@ function registerSetSystemVariable(server: McpServer, deps: ServerDeps): void {
       const start = Date.now();
 
       try {
-        // Look up variable type from CCU to choose correct setter
+        // Look up variable type (cached) to choose correct setter
         let method: string;
-        await rateLimiter.acquire();
-        const allVars = await withRetry(
-          () => session.call("SysVar.getAll"),
-          "SysVar.getAll",
-          logger,
-        ) as Array<{ name: string; type: string }>;
+        let sysVarType: string | undefined;
+        if (typeCache && Date.now() - typeCache.ts < SYSVAR_TYPE_TTL_MS) {
+          sysVarType = typeCache.types.get(args.name);
+        }
+        if (sysVarType === undefined) {
+          await rateLimiter.acquire();
+          const allVars = await withRetry(
+            () => session.call("SysVar.getAll"),
+            "SysVar.getAll",
+            logger,
+          ) as Array<{ name: string; type: string }>;
+          typeCache = { ts: Date.now(), types: new Map(allVars.map((v) => [v.name, v.type])) };
+          sysVarType = typeCache.types.get(args.name);
+        }
 
-        const sysVar = allVars.find((v) => v.name === args.name);
-        if (sysVar) {
-          const varType = sysVar.type.toUpperCase();
+        if (sysVarType !== undefined) {
+          const varType = sysVarType.toUpperCase();
           if (varType.includes("BOOL") || varType.includes("ALARM")) {
             method = "SysVar.setBool";
           } else if (varType.includes("FLOAT") || varType.includes("NUMBER") || varType.includes("INTEGER")) {
@@ -197,15 +212,22 @@ function registerSetSystemVariable(server: McpServer, deps: ServerDeps): void {
             logger.info("tool_call", { tool: "set_system_variable", duration_ms: Date.now() - start, status: "ok" });
             return toolResult({ name: args.name, value: args.value, method: "ReGa.runScript (string)" });
           } else {
-            logger.warn("sysvar_unknown_type", { name: args.name, type: sysVar.type });
-            method = "SysVar.setBool"; // Last resort fallback
+            logger.warn("sysvar_unknown_type", { name: args.name, type: sysVarType });
+            throw new CcuError({
+              error: "INVALID_INPUT",
+              code: 0,
+              message: `System variable "${args.name}" has unsupported type: ${sysVarType}`,
+              hint: "Supported types are bool/alarm, float/integer, enum/list, and string.",
+            });
           }
         } else {
-          // Variable not found — fall back to type inference from value
           logger.warn("sysvar_not_found", { name: args.name });
-          method = typeof args.value === "boolean" ? "SysVar.setBool"
-            : typeof args.value === "number" ? "SysVar.setFloat"
-            : "SysVar.setBool";
+          throw new CcuError({
+            error: "NOT_FOUND",
+            code: 0,
+            message: `System variable not found: ${args.name}`,
+            hint: "Call list_system_variables to see available variables (name must match exactly).",
+          });
         }
 
         await rateLimiter.acquire();
@@ -247,12 +269,31 @@ function registerExecuteProgram(server: McpServer, deps: ServerDeps): void {
       const start = Date.now();
 
       try {
+        // The CCU's Program.execute reports success even for nonexistent IDs
+        // (issue #18) — validate against the program list first.
+        await rateLimiter.acquire();
+        const programs = await withRetry(
+          () => session.call("Program.getAll"),
+          "Program.getAll",
+          logger,
+        ) as Array<{ id: string; name: string }>;
+
+        const program = programs.find((p) => String(p.id) === args.id);
+        if (!program) {
+          throw new CcuError({
+            error: "NOT_FOUND",
+            code: 0,
+            message: `Program not found: ${args.id}`,
+            hint: "Call list_programs to see available programs and their IDs.",
+          });
+        }
+
         await rateLimiter.acquire();
         // No retry — Program.execute is not idempotent
         await session.call("Program.execute", { id: args.id });
 
         logger.info("tool_call", { tool: "execute_program", duration_ms: Date.now() - start, status: "ok" });
-        return toolResult({ id: args.id, executed: true });
+        return toolResult({ id: args.id, name: program.name, executed: true });
       } catch (err) {
         logger.info("tool_call", { tool: "execute_program", duration_ms: Date.now() - start, status: "error" });
         if (err instanceof CcuError) return err.toMcpError();

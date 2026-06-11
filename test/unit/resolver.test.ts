@@ -135,4 +135,40 @@ describe("Resolver", () => {
       expect(resolver.resolveType("UNKNOWN:1", "STATE", cache)).toBeUndefined();
     });
   });
+
+  describe("resolveInterface", () => {
+    // Regression: concurrent cold-cache resolutions duplicated Device.listAllDetail (issue #11)
+    it("coalesces concurrent device list refreshes", async () => {
+      let listCalls = 0;
+      const session = {
+        call: async () => {
+          listCalls++;
+          await new Promise((r) => setTimeout(r, 5));
+          return mockDevices;
+        },
+      } as any;
+      const rateLimiter = { acquire: async () => {} } as any;
+
+      const [a, b] = await Promise.all([
+        resolver.resolveInterface("000A1BE9A71F15:1", session, rateLimiter, logger),
+        resolver.resolveInterface("00109D898C36B0", session, rateLimiter, logger),
+      ]);
+
+      expect(a).toBe("HmIP-RF");
+      expect(b).toBe("HmIP-RF");
+      expect(listCalls).toBe(1);
+    });
+  });
+});
+
+describe("resolveInterface failure (coverage round)", () => {
+  it("throws NOT_FOUND when the address is unknown even after refresh", async () => {
+    const { CcuError } = await import("../../src/middleware/error-mapper.js");
+    const resolver = new Resolver();
+    const session = { call: async () => mockDevices } as any;
+    const rateLimiter = { acquire: async () => {} } as any;
+
+    await expect(resolver.resolveInterface("DOES-NOT-EXIST:1", session, rateLimiter, logger))
+      .rejects.toSatisfy((e: unknown) => e instanceof CcuError && (e as any).structured.error === "NOT_FOUND");
+  });
 });

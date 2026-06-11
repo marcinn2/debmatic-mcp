@@ -8,6 +8,9 @@ import { CACHE_VERSION } from "./types.js";
 
 const CACHE_FILENAME = "device-type-cache.json";
 
+// Device types warmed in parallel; per-request pacing stays with the rate limiter
+const WARM_CONCURRENCY = 3;
+
 type RawParamDesc = {
   ID: string; TYPE: string; OPERATIONS: string;
   MIN?: string; MAX?: string; DEFAULT?: string; UNIT?: string; VALUE_LIST?: string[];
@@ -35,6 +38,7 @@ export class DeviceTypeCache {
   private readonly ttl: number;
   private readonly logger: Logger;
   private warming = false;
+  private inflightQueries = new Map<string, Promise<CachedDeviceType | undefined>>();
 
   constructor(cacheDir: string, ttl: number, logger: Logger) {
     this.cacheDir = cacheDir;
@@ -153,8 +157,10 @@ export class DeviceTypeCache {
 
       this.logger.info("cache_warm_types_found", { count: devicesByType.size });
 
-      // Query paramset descriptions for each unique device type
-      for (const [deviceType, info] of devicesByType) {
+      // Query paramset descriptions for each unique device type.
+      // Bounded concurrency: a few types in flight cut warm time roughly in
+      // half while the rate limiter still caps overall CCU load.
+      const processType = async (deviceType: string, info: { interface: string; channels: string[] }) => {
         try {
           const channels: CachedDeviceType["channels"] = {};
 
@@ -197,7 +203,20 @@ export class DeviceTypeCache {
         } catch (err) {
           this.logger.warn("cache_warm_type_failed", { deviceType, error: (err as Error).message });
         }
-      }
+      };
+
+      const entries = [...devicesByType];
+      let nextIndex = 0;
+      const workers = Array.from(
+        { length: Math.min(WARM_CONCURRENCY, entries.length) },
+        async () => {
+          while (nextIndex < entries.length) {
+            const [deviceType, info] = entries[nextIndex++]!;
+            await processType(deviceType, info);
+          }
+        },
+      );
+      await Promise.all(workers);
 
       await this.saveToDisk();
 
@@ -210,10 +229,31 @@ export class DeviceTypeCache {
     }
   }
 
-  /** Add a single type to cache (live query fallback). */
+  /**
+   * Add a single type to cache (live query fallback).
+   * Single-flight per device type: concurrent calls share one live query.
+   */
   async queryAndCache(
     deviceType: string,
     deviceAddress: string,
+    interfaceName: string,
+    channels: string[],
+    session: SessionManager,
+    rateLimiter: RateLimiter,
+  ): Promise<CachedDeviceType | undefined> {
+    const inflight = this.inflightQueries.get(deviceType);
+    if (inflight) return inflight;
+
+    const query = this.doQueryAndCache(deviceType, interfaceName, channels, session, rateLimiter)
+      .finally(() => {
+        this.inflightQueries.delete(deviceType);
+      });
+    this.inflightQueries.set(deviceType, query);
+    return query;
+  }
+
+  private async doQueryAndCache(
+    deviceType: string,
     interfaceName: string,
     channels: string[],
     session: SessionManager,

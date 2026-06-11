@@ -4,12 +4,15 @@ const _require = createRequire(import.meta.url);
 /** Server version — read from package.json at runtime, single source of truth. */
 export const VERSION: string = (_require("../package.json") as { version: string }).version;
 
-/** Escape a string for safe interpolation into HomeMatic Script double-quoted strings. */
+/**
+ * Escape a string for safe interpolation into HomeMatic Script double-quoted strings.
+ * Verified against a live CCU (issue #16): \\ \" \n are real ReGa escapes; # needs
+ * no escaping inside string literals — `\#` keeps the backslash and corrupts the value.
+ */
 export function escapeHmScript(input: string): string {
   return input
     .replace(/\\/g, "\\\\")
     .replace(/"/g, '\\"')
-    .replace(/#/g, "\\#")
     .replace(/\n/g, "\\n")
     .replace(/\r/g, "\\r");
 }
@@ -28,14 +31,18 @@ export function tryParseJson(text: string): unknown {
  * Parse a CCU string value to a native JS type.
  * "19.000000" → 19, "true" → true, "false" → false, "" → null, else string.
  */
+// Plain decimal notation only. Rejects formats Number() would also accept but
+// that lose information on round-trip: leading zeros ("0123"), sign prefix
+// ("+49170..."), hex ("0x1A"), exponent ("1e5"), and "Infinity".
+const DECIMAL_RE = /^-?(0|[1-9]\d*)(\.\d+)?$/;
+
 export function parseValue(val: unknown): unknown {
   if (val === null || val === undefined) return null;
   const s = String(val);
   if (s === "") return null;
   if (s === "true") return true;
   if (s === "false") return false;
-  const n = Number(s);
-  if (!isNaN(n) && s.trim() !== "") return n;
+  if (DECIMAL_RE.test(s)) return Number(s);
   return s;
 }
 

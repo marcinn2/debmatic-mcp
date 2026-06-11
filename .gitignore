@@ -31,3 +31,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Test coverage output
+coverage/
+
+# Local review reports
+code-review-report.md

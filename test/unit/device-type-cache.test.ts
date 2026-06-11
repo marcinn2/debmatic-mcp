@@ -129,8 +129,105 @@ describe("DeviceTypeCache", () => {
     expect(files).not.toContain("device-type-cache.json.tmp");
   });
 
+  // Regression: concurrent live queries for the same type were duplicated (issue #11)
+  it("coalesces concurrent queryAndCache calls for the same type", async () => {
+    const cache = new DeviceTypeCache(tempDir, 86400, logger);
+    let calls = 0;
+    const session = {
+      call: async () => {
+        calls++;
+        await new Promise((r) => setTimeout(r, 5));
+        return [];
+      },
+    } as any;
+    const rateLimiter = { acquire: async () => {} } as any;
+
+    const [a, b] = await Promise.all([
+      cache.queryAndCache("HmIP-X", "ADDR", "HmIP-RF", ["ADDR:1"], session, rateLimiter),
+      cache.queryAndCache("HmIP-X", "ADDR", "HmIP-RF", ["ADDR:1"], session, rateLimiter),
+    ]);
+
+    // 1 channel × 2 paramset keys = 2 CCU calls if coalesced, 4 if duplicated
+    expect(calls).toBe(2);
+    expect(a).toBe(b);
+
+    // let the fire-and-forget saveToDisk finish before afterEach removes tempDir
+    await new Promise((r) => setTimeout(r, 25));
+  });
+
+  // Issue #12: warming processes device types with bounded concurrency
+  it("warm populates the cache for all device types", async () => {
+    const cache = new DeviceTypeCache(tempDir, 86400, logger);
+    const session = {
+      call: async (method: string) => {
+        if (method === "Interface.listInterfaces") return [{ name: "HmIP-RF" }];
+        if (method === "Interface.listDevices") return [
+          { type: "HmIP-A", address: "A1", children: ["A1:1"] },
+          { type: "HmIP-B", address: "B1", children: ["B1:1"] },
+          { type: "HmIP-C", address: "C1", children: ["C1:1"] },
+          { type: "HmIP-D", address: "D1", children: ["D1:1"] },
+        ];
+        if (method === "Interface.getParamsetDescription") {
+          return [{ ID: "STATE", TYPE: "BOOL", OPERATIONS: "7" }];
+        }
+        return null;
+      },
+    } as any;
+    const rateLimiter = { acquire: async () => {} } as any;
+
+    await cache.warm(session, rateLimiter);
+
+    expect(cache.size()).toBe(4);
+    expect(cache.get("HmIP-A")!.channels["1"]!.paramsets["VALUES"]!["STATE"]!.type).toBe("BOOL");
+  });
+
   it("isWarming returns false by default", () => {
     const cache = new DeviceTypeCache(tempDir, 86400, logger);
     expect(cache.isWarming()).toBe(false);
+  });
+});
+
+describe("warm edge cases (coverage round)", () => {
+  let tempDir: string;
+  beforeEach(async () => { tempDir = await mkdtemp(join(tmpdir(), "debmatic-cache-test2-")); });
+  afterEach(async () => { await rm(tempDir, { recursive: true, force: true }); });
+
+  it("skips interfaces whose device listing fails and continues with the rest", async () => {
+    const cache = new DeviceTypeCache(tempDir, 86400, logger);
+    const session = {
+      call: async (method: string, params?: { interface?: string }) => {
+        if (method === "Interface.listInterfaces") return [{ name: "Broken" }, { name: "HmIP-RF" }];
+        if (method === "Interface.listDevices") {
+          if (params?.interface === "Broken") throw new Error("interface down");
+          return [{ type: "HmIP-A", address: "A1", children: ["A1:1"] }];
+        }
+        if (method === "Interface.getParamsetDescription") {
+          return [{ ID: "STATE", TYPE: "BOOL", OPERATIONS: "7" }];
+        }
+        return null;
+      },
+    } as any;
+    const rateLimiter = { acquire: async () => {} } as any;
+
+    await cache.warm(session, rateLimiter);
+    expect(cache.size()).toBe(1);
+  });
+
+  it("preserves optional param description fields (min/max/unit/valueList)", async () => {
+    const cache = new DeviceTypeCache(tempDir, 86400, logger);
+    const session = {
+      call: async (method: string, params?: { paramsetKey?: string }) => {
+        if (method === "Interface.getParamsetDescription" && params?.paramsetKey === "VALUES") {
+          return [{ ID: "LEVEL", TYPE: "FLOAT", OPERATIONS: "7", MIN: "0", MAX: "1.01", DEFAULT: "0", UNIT: "%", VALUE_LIST: ["a", "b"] }];
+        }
+        return [];
+      },
+    } as any;
+    const rateLimiter = { acquire: async () => {} } as any;
+
+    const cached = await cache.queryAndCache("HmIP-X", "A1", "HmIP-RF", ["A1:1"], session, rateLimiter);
+    const param = cached!.channels["1"]!.paramsets["VALUES"]!["LEVEL"]!;
+    expect(param).toMatchObject({ type: "FLOAT", operations: 7, min: 0, max: 1.01, unit: "%", valueList: ["a", "b"] });
+    await new Promise((r) => setTimeout(r, 25)); // let background save finish
   });
 });

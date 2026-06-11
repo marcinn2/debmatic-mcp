@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
-import { createServer } from "node:http";
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createServer, type Server as HttpServer } from "node:http";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { loadConfig } from "./config.js";
 import { createLogger } from "./logger.js";
 import { SessionManager } from "./ccu/session.js";
@@ -44,115 +45,146 @@ async function main(): Promise<void> {
     logger.error("cache_warm_background_error", { error: (err as Error).message });
   });
 
-  // Create resolver and shared deps for MCP servers
+  // Create resolver and shared tool dependencies
   const resolver = new Resolver();
-  const serverDeps = { config, session, rateLimiter, logger, deviceTypeCache, resolver };
+  const deps = { config, session, rateLimiter, logger, deviceTypeCache, resolver };
 
-  // Connect transport
+  let poller: ResourcePoller;
+  let closeTransports: () => Promise<void>;
+  let httpServer: HttpServer | null = null;
+
   if (config.mcp.transport === "stdio") {
-    const mcpServer = createMcpServer(serverDeps);
-    const poller = new ResourcePoller(mcpServer.server, session, rateLimiter, logger, config.resourcePollInterval);
+    const mcpServer = createMcpServer(deps);
     const transport = new StdioServerTransport();
     await mcpServer.connect(transport);
+    poller = new ResourcePoller(
+      () => mcpServer.server.sendResourceListChanged(),
+      session, rateLimiter, logger, config.resourcePollInterval,
+    );
     poller.start();
+    closeTransports = () => mcpServer.close();
     logger.info("server_ready", { transport: "stdio" });
-
-    // Graceful shutdown with re-entrancy guard
-    let shuttingDown = false;
-    const shutdown = async (signal: string) => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      logger.info("shutdown", { signal });
-
-      const forceExit = setTimeout(() => process.exit(1), 10_000);
-      forceExit.unref();
-
-      try {
-        poller.stop();
-        rateLimiter.destroy();
-        await deviceTypeCache.saveToDisk();
-        await session.logout();
-        session.destroy();
-        await mcpServer.close();
-      } catch (err) {
-        logger.error("shutdown_error", { error: (err as Error).message });
-      }
-      process.exit(0);
-    };
-
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("SIGINT", () => shutdown("SIGINT"));
   } else {
-    // HTTP mode: fresh transport + server per request (stateless, SDK 1.28+ requirement)
+    // HTTP mode with auth.
+    // A stateless StreamableHTTPServerTransport only survives a single request,
+    // so each MCP session gets its own transport + server (deps are shared),
+    // routed by the Mcp-Session-Id header per the SDK's session pattern.
     const authToken = await resolveAuthToken(config.mcp.authToken, config.cache.dir, logger);
+    const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
 
-    const httpServer = createServer(async (req, res) => {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
-      res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+    httpServer = createServer(async (req, res) => {
+      try {
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+        res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
-      if (req.method === "OPTIONS") {
-        res.writeHead(204);
-        res.end();
-        return;
+        if (req.method === "OPTIONS") {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+
+        // Health check endpoint
+        if (req.url === "/health" && req.method === "GET") {
+          handleHealthRequest(req, res, { session, deviceTypeCache });
+          return;
+        }
+
+        // Auth check for MCP endpoints. The scheme is case-insensitive per
+        // RFC 7235; the token comparison is timing-safe (hash both sides so
+        // length differences don't create a timing side-channel).
+        const authHeader = req.headers.authorization ?? "";
+        const presented = authHeader.match(/^Bearer\s+(.+)$/i)?.[1] ?? "";
+        const ha = createHash("sha256").update(presented).digest();
+        const hb = createHash("sha256").update(authToken).digest();
+        const headerValid = timingSafeEqual(ha, hb);
+        if (!headerValid) {
+          res.writeHead(401, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unauthorized" }));
+          return;
+        }
+
+        // Existing session: route to its transport (POST, GET/SSE, DELETE)
+        const sessionId = req.headers["mcp-session-id"];
+        if (typeof sessionId === "string" && sessions.has(sessionId)) {
+          await sessions.get(sessionId)!.transport.handleRequest(req, res);
+          return;
+        }
+
+        // No (known) session: create a fresh transport + server pair. The
+        // transport itself rejects non-initialize requests without a session.
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            sessions.set(sid, { server: sessionServer, transport });
+            logger.info("mcp_session_started", { sessions: sessions.size });
+          },
+        });
+        transport.onclose = () => {
+          if (transport.sessionId && sessions.delete(transport.sessionId)) {
+            logger.info("mcp_session_closed", { sessions: sessions.size });
+          }
+        };
+        const sessionServer = createMcpServer(deps);
+        await sessionServer.connect(transport);
+        await transport.handleRequest(req, res);
+      } catch (err) {
+        // One bad request must not take down the process (unhandled rejection)
+        logger.error("http_handler_error", { error: (err as Error).message });
+        if (!res.headersSent) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+        }
+        res.end(JSON.stringify({ error: "Internal error" }));
       }
-
-      // Health check endpoint
-      if (req.url === "/health" && req.method === "GET") {
-        handleHealthRequest(req, res, { session, deviceTypeCache });
-        return;
-      }
-
-      // Auth check for MCP endpoints (timing-safe: hash both sides so length
-      // differences don't create a timing side-channel)
-      const authHeader = req.headers.authorization ?? "";
-      const expected = `Bearer ${authToken}`;
-      const ha = createHash("sha256").update(authHeader).digest();
-      const hb = createHash("sha256").update(expected).digest();
-      const headerValid = timingSafeEqual(ha, hb);
-      if (!headerValid) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized" }));
-        return;
-      }
-
-      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-      const mcpServer = createMcpServer(serverDeps);
-      await mcpServer.connect(transport);
-      await transport.handleRequest(req, res);
-      await mcpServer.close();
     });
+
+    poller = new ResourcePoller(
+      async () => {
+        await Promise.allSettled(
+          [...sessions.values()].map((s) => s.server.server.sendResourceListChanged()),
+        );
+      },
+      session, rateLimiter, logger, config.resourcePollInterval,
+    );
+    poller.start();
+    closeTransports = async () => {
+      await Promise.allSettled([...sessions.values()].map((s) => s.server.close()));
+      sessions.clear();
+    };
 
     httpServer.listen(config.mcp.port, () => {
       logger.info("server_ready", { transport: "http", port: config.mcp.port });
     });
-
-    // Graceful shutdown with re-entrancy guard
-    let shuttingDown = false;
-    const shutdown = async (signal: string) => {
-      if (shuttingDown) return;
-      shuttingDown = true;
-      logger.info("shutdown", { signal });
-
-      const forceExit = setTimeout(() => process.exit(1), 10_000);
-      forceExit.unref();
-
-      try {
-        rateLimiter.destroy();
-        await deviceTypeCache.saveToDisk();
-        await session.logout();
-        session.destroy();
-        httpServer.close();
-      } catch (err) {
-        logger.error("shutdown_error", { error: (err as Error).message });
-      }
-      process.exit(0);
-    };
-
-    process.on("SIGTERM", () => shutdown("SIGTERM"));
-    process.on("SIGINT", () => shutdown("SIGINT"));
   }
+
+  // Graceful shutdown with re-entrancy guard
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info("shutdown", { signal });
+
+    // Safety net: force exit after 10s if graceful shutdown hangs
+    const forceExit = setTimeout(() => process.exit(1), 10_000);
+    forceExit.unref();
+
+    try {
+      poller.stop();
+      rateLimiter.destroy();
+      httpServer?.close();
+      await deviceTypeCache.saveToDisk();
+      await session.logout();
+      session.destroy();
+      await closeTransports();
+    } catch (err) {
+      logger.error("shutdown_error", { error: (err as Error).message });
+    }
+    process.exit(0);
+  };
+
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }
 
 main().catch((err) => {

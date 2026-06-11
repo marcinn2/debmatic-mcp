@@ -6,7 +6,7 @@ const logger = new Logger("error");
 
 function createMocks() {
   return {
-    server: { sendResourceListChanged: vi.fn(async () => {}) } as any,
+    notify: vi.fn(async () => {}),
     session: { call: vi.fn(async () => []) } as any,
     rateLimiter: { acquire: vi.fn(async () => {}) } as any,
   };
@@ -18,7 +18,7 @@ describe("ResourcePoller", () => {
 
   it("start sets interval and stop clears it", () => {
     const mocks = createMocks();
-    const poller = new ResourcePoller(mocks.server, mocks.session, mocks.rateLimiter, logger, 30);
+    const poller = new ResourcePoller(mocks.notify, mocks.session, mocks.rateLimiter, logger, 30);
     poller.start();
     poller.stop();
     // No throw, timer cleaned up
@@ -27,12 +27,12 @@ describe("ResourcePoller", () => {
   it("does not emit event on first poll (no previous hash)", async () => {
     const mocks = createMocks();
     mocks.session.call.mockResolvedValue([{ id: "1" }]);
-    const poller = new ResourcePoller(mocks.server, mocks.session, mocks.rateLimiter, logger, 10);
+    const poller = new ResourcePoller(mocks.notify, mocks.session, mocks.rateLimiter, logger, 10);
     poller.start();
 
     await vi.advanceTimersByTimeAsync(10_000);
 
-    expect(mocks.server.sendResourceListChanged).not.toHaveBeenCalled();
+    expect(mocks.notify).not.toHaveBeenCalled();
     poller.stop();
   });
 
@@ -44,16 +44,16 @@ describe("ResourcePoller", () => {
       return [{ data: callCount }]; // different on each call
     });
 
-    const poller = new ResourcePoller(mocks.server, mocks.session, mocks.rateLimiter, logger, 10);
+    const poller = new ResourcePoller(mocks.notify, mocks.session, mocks.rateLimiter, logger, 10);
     poller.start();
 
     // First poll — sets baseline hashes
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(mocks.server.sendResourceListChanged).not.toHaveBeenCalled();
+    expect(mocks.notify).not.toHaveBeenCalled();
 
     // Second poll — data changed
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(mocks.server.sendResourceListChanged).toHaveBeenCalled();
+    expect(mocks.notify).toHaveBeenCalled();
     poller.stop();
   });
 
@@ -61,13 +61,13 @@ describe("ResourcePoller", () => {
     const mocks = createMocks();
     mocks.session.call.mockResolvedValue([{ data: "static" }]);
 
-    const poller = new ResourcePoller(mocks.server, mocks.session, mocks.rateLimiter, logger, 10);
+    const poller = new ResourcePoller(mocks.notify, mocks.session, mocks.rateLimiter, logger, 10);
     poller.start();
 
     await vi.advanceTimersByTimeAsync(10_000); // first poll
     await vi.advanceTimersByTimeAsync(10_000); // second poll — same data
 
-    expect(mocks.server.sendResourceListChanged).not.toHaveBeenCalled();
+    expect(mocks.notify).not.toHaveBeenCalled();
     poller.stop();
   });
 
@@ -80,7 +80,7 @@ describe("ResourcePoller", () => {
       return [];
     });
 
-    const poller = new ResourcePoller(mocks.server, mocks.session, mocks.rateLimiter, logger, 10);
+    const poller = new ResourcePoller(mocks.notify, mocks.session, mocks.rateLimiter, logger, 10);
     poller.start();
 
     await vi.advanceTimersByTimeAsync(10_000);
@@ -92,13 +92,56 @@ describe("ResourcePoller", () => {
 
   it("acquires rate limiter before each resource poll", async () => {
     const mocks = createMocks();
-    const poller = new ResourcePoller(mocks.server, mocks.session, mocks.rateLimiter, logger, 10);
+    const poller = new ResourcePoller(mocks.notify, mocks.session, mocks.rateLimiter, logger, 10);
     poller.start();
 
     await vi.advanceTimersByTimeAsync(10_000);
 
     // 5 resources = 5 acquire calls
     expect(mocks.rateLimiter.acquire).toHaveBeenCalledTimes(5);
+    poller.stop();
+  });
+});
+
+describe("ResourcePoller backoff and notify failure (coverage round)", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("applies exponential backoff after consecutive failures and resets on success", async () => {
+    const mocks = createMocks();
+    mocks.session.call.mockRejectedValue(new Error("ccu down"));
+    const poller = new ResourcePoller(mocks.notify, mocks.session, mocks.rateLimiter, logger, 10);
+    poller.start();
+
+    await vi.advanceTimersByTimeAsync(10_000); // first cycle fails
+    expect((poller as any).consecutiveFailures).toBe(1);
+    await vi.advanceTimersByTimeAsync(10_000); // backoff 1x -> second cycle fails
+    expect((poller as any).consecutiveFailures).toBe(2);
+    // next delay is now 2x base; nothing fires after 1x
+    const callsBefore = mocks.session.call.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(mocks.session.call.mock.calls.length).toBe(callsBefore);
+
+    mocks.session.call.mockResolvedValue([{ ok: true }]);
+    await vi.advanceTimersByTimeAsync(10_000); // completes the 2x window -> success
+    expect((poller as any).consecutiveFailures).toBe(0);
+    poller.stop();
+  });
+
+  it("swallows notify failures and keeps polling", async () => {
+    const mocks = createMocks();
+    let value = 0;
+    mocks.session.call.mockImplementation(async () => [{ v: value }]);
+    mocks.notify.mockRejectedValue(new Error("no transport"));
+    const poller = new ResourcePoller(mocks.notify, mocks.session, mocks.rateLimiter, logger, 10);
+    poller.start();
+
+    await vi.advanceTimersByTimeAsync(10_000); // baseline hashes
+    value = 1;
+    await vi.advanceTimersByTimeAsync(10_000); // change -> notify rejects, must not throw
+    expect(mocks.notify).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000); // still polling
+    expect((poller as any).consecutiveFailures).toBe(0);
     poller.stop();
   });
 });

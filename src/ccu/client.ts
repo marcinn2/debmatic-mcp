@@ -18,7 +18,7 @@ export class CcuClient {
 
     if (config.https) {
       this.dispatcher = new Agent({
-        connect: { rejectUnauthorized: false },
+        connect: { rejectUnauthorized: config.tlsVerify },
         pipelining: 0,
         keepAliveTimeout: 1000,
       });
@@ -40,17 +40,24 @@ export class CcuClient {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), effectiveTimeout);
 
-      const httpResponse = await undiciFetch(this.baseUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-        signal: controller.signal,
-        dispatcher: this.dispatcher,
-      });
+      let text: string;
+      let httpStatus = 0;
+      try {
+        const httpResponse = await undiciFetch(this.baseUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(request),
+          signal: controller.signal,
+          dispatcher: this.dispatcher,
+        });
+        httpStatus = httpResponse.status;
 
-      clearTimeout(timer);
-
-      const text = await httpResponse.text();
+        // The abort signal also covers the body read, so the timeout
+        // applies to the full request, not just the response headers.
+        text = await httpResponse.text();
+      } finally {
+        clearTimeout(timer);
+      }
 
       try {
         response = JSON.parse(text) as CcuRpcResponse;
@@ -58,8 +65,8 @@ export class CcuClient {
         throw new CcuError({
           error: "CCU_ERROR",
           code: 0,
-          message: `Invalid JSON response from CCU: ${text.slice(0, 200)}`,
-          hint: "CCU returned invalid JSON. It may be overloaded or misconfigured.",
+          message: `Invalid JSON response from CCU (HTTP ${httpStatus}): ${text.slice(0, 200)}`,
+          hint: "CCU returned invalid JSON. It may be overloaded, misconfigured, or behind a proxy returning an error page.",
           ccuMethod: method,
         });
       }

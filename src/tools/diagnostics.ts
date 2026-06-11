@@ -22,10 +22,15 @@ function registerGetServiceMessages(server: McpServer, deps: ServerDeps): void {
       const start = Date.now();
 
       try {
+        // Two single passes instead of a nested per-alarm channel scan: emit the
+        // alarms first while collecting their addresses, then resolve channel
+        // names in ONE sweep over all channels (sentinel-comma Find, as in
+        // buildGetValuesScript). The name merge happens in JS below.
         const script = `
           object svcs = dom.GetObject(ID_SERVICES);
           boolean first = true;
-          Write("[");
+          string addrList = ",";
+          Write('{"alarms":[');
           if (svcs) {
             string sId;
             foreach(sId, svcs.EnumIDs()) {
@@ -36,7 +41,6 @@ function registerGetServiceMessages(server: McpServer, deps: ServerDeps): void {
                 string alName = svc.Name();
                 string chAddr = "";
                 string dpName = "";
-                string chName = "";
                 integer alPos = alName.Find("AL-");
                 if (alPos >= 0) {
                   string rest = alName.Substr(3, alName.Length());
@@ -46,26 +50,35 @@ function registerGetServiceMessages(server: McpServer, deps: ServerDeps): void {
                     dpName = rest.Substr(dotPos + 1, rest.Length());
                   }
                 }
-                ! Look up channel by address
-                if (chAddr != "") {
-                  string cId;
-                  foreach(cId, dom.GetObject(ID_CHANNELS).EnumUsedIDs()) {
-                    object c = dom.GetObject(cId);
-                    if (c && c.Address() == chAddr) {
-                      chName = c.Name();
-                    }
-                  }
-                }
+                if (chAddr != "") { addrList = addrList # chAddr # ","; }
+                ! JSON-escape user-controlled names (backslash first, then quote)
+                dpName = dpName.Replace("\\\\", "\\\\\\\\");
+                dpName = dpName.Replace("\\"", "\\\\\\"");
                 Write('{"id":"' # sId # '"');
                 Write(',"type":"' # dpName # '"');
                 Write(',"address":"' # chAddr # '"');
-                Write(',"channelName":"' # chName # '"');
                 Write(',"timestamp":"' # svc.AlOccurrenceTime() # '"');
                 Write('}');
               }
             }
           }
-          Write("]");
+          Write('],"channelNames":{');
+          boolean firstCh = true;
+          string cId;
+          foreach(cId, dom.GetObject(ID_CHANNELS).EnumUsedIDs()) {
+            object c = dom.GetObject(cId);
+            if (c) {
+              string needle = "," # c.Address() # ",";
+              if (addrList.Find(needle) >= 0) {
+                if (!firstCh) { Write(","); } firstCh = false;
+                string cName = c.Name();
+                cName = cName.Replace("\\\\", "\\\\\\\\");
+                cName = cName.Replace("\\"", "\\\\\\"");
+                Write('"' # c.Address() # '":"' # cName # '"');
+              }
+            }
+          }
+          Write("}}");
         `;
 
         await rateLimiter.acquire();
@@ -75,7 +88,18 @@ function registerGetServiceMessages(server: McpServer, deps: ServerDeps): void {
           logger,
         );
 
-        const messages = typeof result === "string" ? tryParseJson(result) : result;
+        const parsed = typeof result === "string" ? tryParseJson(result) : result;
+
+        // Merge channel names into the alarms (same output shape as before)
+        let messages: unknown = parsed;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)
+            && Array.isArray((parsed as Record<string, unknown>).alarms)) {
+          const names = ((parsed as Record<string, unknown>).channelNames ?? {}) as Record<string, string>;
+          messages = ((parsed as Record<string, unknown>).alarms as Array<Record<string, unknown>>).map((a) => ({
+            ...a,
+            channelName: names[a.address as string] ?? "",
+          }));
+        }
 
         logger.info("tool_call", { tool: "get_service_messages", duration_ms: Date.now() - start, status: "ok" });
         return toolResult(messages);
