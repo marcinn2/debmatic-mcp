@@ -127,6 +127,10 @@ This only updates the `debmatic` entry — other servers in your `.mcp.json` are
 curl http://localhost:3000/health
 ```
 
+#### Browser-based clients (CORS)
+
+The HTTP server sends permissive CORS headers and answers `OPTIONS` preflight requests, so browser-based MCP clients like [MCP Inspector](https://github.com/modelcontextprotocol/inspector) can connect directly — no proxy needed. Authentication is still enforced: browsers can read the endpoint, but every MCP request needs the bearer token. (Contributed idea by [@marcinn2](https://github.com/marcinn2).)
+
 ### HTTPS
 
 If your CCU uses HTTPS (self-signed certificates are fine), add these environment variables:

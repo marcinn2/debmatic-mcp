@@ -21,7 +21,8 @@
     "dev": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit && tsc -p tsconfig.test.json"
+    "lint": "tsc --noEmit && tsc -p tsconfig.test.json",
+    "prepublishOnly": "npm run lint && npm test && npm run build"
   },
   "engines": {
     "node": ">=22"
@@ -49,14 +50,14 @@
   },
   "homepage": "https://github.com/claymore666/debmatic-mcp#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.28.0",
-    "undici": "^7.24.6",
-    "zod": "^3.25 || ^4.0"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "undici": "^8.4.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
+    "@types/node": "^25.9.3",
     "@vitest/coverage-v8": "^4.1.8",
-    "typescript": "^6.0.2",
-    "vitest": "^4.1.2"
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
   }
 }

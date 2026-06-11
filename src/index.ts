@@ -74,6 +74,25 @@ async function main(): Promise<void> {
 
     httpServer = createServer(async (req, res) => {
       try {
+        // CORS so browser-based MCP clients (e.g. MCP Inspector) can connect
+        // directly. Auth is still enforced via the bearer token below.
+        // Mcp-Session-Id must be exposed or browsers can't reuse the session.
+        // Credit: @marcinn2 (marcinn2/debmatic-mcp@d33a0cb)
+        res.setHeader("Access-Control-Allow-Origin", "*");
+        res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+        res.setHeader(
+          "Access-Control-Allow-Headers",
+          "Content-Type, Authorization, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID",
+        );
+        res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
+        res.setHeader("Access-Control-Max-Age", "86400");
+
+        if (req.method === "OPTIONS") {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+
         // Health check endpoint
         if (req.url === "/health" && req.method === "GET") {
           handleHealthRequest(req, res, { session, deviceTypeCache });

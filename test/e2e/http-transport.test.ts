@@ -160,6 +160,43 @@ describe.skipIf(!existsSync(DIST))("HTTP transport e2e (built server, mocked CCU
     expect(res.status).toBeGreaterThanOrEqual(400);
   });
 
+  // CORS (issue #19, credit @marcinn2): browser clients need preflight + exposed session header
+  it("answers OPTIONS preflight with 204 and CORS headers, without auth", async () => {
+    const res = await fetch(`http://127.0.0.1:${mcpPort}/`, {
+      method: "OPTIONS",
+      headers: {
+        "Origin": "http://localhost:6274",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type, authorization, mcp-session-id",
+      },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    expect(res.headers.get("access-control-allow-methods")).toContain("POST");
+    expect(res.headers.get("access-control-allow-headers")?.toLowerCase()).toContain("mcp-session-id");
+  });
+
+  it("sets CORS headers on MCP responses and exposes Mcp-Session-Id", async () => {
+    const res = await mcpPost(mcpPort, {
+      jsonrpc: "2.0", id: 0, method: "initialize",
+      params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "cors", version: "1" } },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    expect(res.headers.get("access-control-expose-headers")?.toLowerCase()).toContain("mcp-session-id");
+    await res.text();
+  });
+
+  it("sets CORS headers on 401 responses too", async () => {
+    const res = await fetch(`http://127.0.0.1:${mcpPort}/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json, text/event-stream" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+
   // Must be last: terminates the server and asserts a clean exit
   it("shuts down gracefully on SIGTERM with exit code 0", async () => {
     const exited = new Promise<number | null>((resolve) => child.once("exit", (code) => resolve(code)));
