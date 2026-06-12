@@ -2,6 +2,10 @@
 
 Talk to your HomeMatic smart home from Claude, Cursor, or any MCP client.
 
+<a href="https://glama.ai/mcp/servers/claymore666/debmatic-mcp">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/claymore666/debmatic-mcp/badge" alt="debmatic-mcp MCP server" />
+</a>
+
 debmatic-mcp connects to the CCU's built-in JSON-RPC API and exposes your devices, rooms, programs, and system variables as MCP tools. No addons, no XML-API, no cloud — just a direct connection to the CCU on your local network.
 
 Built for [debmatic](https://github.com/alexreinert/debmatic) (HomeMatic on Debian) but works with any CCU3 or RaspberryMatic installation that exposes the standard `/api/homematic.cgi` endpoint.
@@ -126,6 +130,12 @@ This only updates the `debmatic` entry — other servers in your `.mcp.json` are
 ```bash
 curl http://localhost:3000/health
 ```
+
+#### Browser-based clients (CORS)
+
+The HTTP server sends permissive CORS headers and answers `OPTIONS` preflight requests, so browser-based MCP clients like [MCP Inspector](https://github.com/modelcontextprotocol/inspector) can connect directly — no proxy needed. Authentication is still enforced: browsers can read the endpoint, but every MCP request needs the bearer token.
+
+CORS support was first implemented by [@marcinn2](https://github.com/marcinn2) in his fork [marcinn2/debmatic-mcp](https://github.com/marcinn2/debmatic-mcp) — thanks!
 
 ### HTTPS
 

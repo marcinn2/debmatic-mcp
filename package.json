@@ -1,6 +1,6 @@
 {
   "name": "debmatic-mcp",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "description": "MCP server for controlling HomeMatic smart home devices via the CCU JSON-RPC API",
   "mcpName": "io.github.claymore666/debmatic-mcp",
   "type": "module",
@@ -19,10 +19,11 @@
     "start:stdio": "node dist/index.js --stdio",
     "start:http": "node dist/index.js --http",
     "dev": "tsc --watch",
+    "pretest": "npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "prepublishOnly": "npm run lint && npm test && npm run build"
+    "prepublishOnly": "npm run lint && npm test"
   },
   "engines": {
     "node": ">=22"
@@ -51,13 +52,13 @@
   "homepage": "https://github.com/marcinn2/debmatic-mcp#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "undici": "^8.3.0",
+    "undici": "^8.4.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/node": "^25.9.1",
+    "@types/node": "^25.9.3",
     "@vitest/coverage-v8": "^4.1.8",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.8"
   }
 }
