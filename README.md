@@ -1,14 +1,14 @@
-# debmatic-mcp
+# ccu-mcp
 
 Talk to your HomeMatic smart home from Claude, Cursor, or any MCP client.
 
-<a href="https://glama.ai/mcp/servers/claymore666/debmatic-mcp">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/claymore666/debmatic-mcp/badge" alt="debmatic-mcp MCP server" />
+<a href="https://glama.ai/mcp/servers/claymore666/ccu-mcp">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/claymore666/ccu-mcp/badge" alt="ccu-mcp MCP server" />
 </a>
 
-debmatic-mcp connects to the CCU's built-in JSON-RPC API and exposes your devices, rooms, programs, and system variables as MCP tools. No addons, no XML-API, no cloud — just a direct connection to the CCU on your local network.
+ccu-mcp connects to the CCU's built-in JSON-RPC API and exposes your devices, rooms, programs, and system variables as MCP tools. No addons, no XML-API, no cloud — just a direct connection to the CCU on your local network.
 
-Built for [debmatic](https://github.com/alexreinert/debmatic) (HomeMatic on Debian) but works with any CCU3 or RaspberryMatic installation that exposes the standard `/api/homematic.cgi` endpoint.
+Works with any HomeMatic CCU: [debmatic](https://github.com/alexreinert/debmatic) (HomeMatic on Debian), a CCU3, or [OpenCCU](https://github.com/OpenCCU/OpenCCU) (formerly RaspberryMatic) — anything that exposes the standard `/api/homematic.cgi` endpoint.
 
 ## What can it do?
 
@@ -28,7 +28,7 @@ The MCP server handles device discovery, type resolution, session management, an
 
 ## Prerequisites
 
-- A running HomeMatic CCU (debmatic, CCU3, or RaspberryMatic) reachable on your network
+- A running HomeMatic CCU (debmatic, CCU3, or OpenCCU — formerly RaspberryMatic) reachable on your network
 - The CCU's admin username and password (the same credentials you use to log into the WebUI)
 - Node.js 22+ (for running from source or stdio mode) or Docker
 
@@ -37,7 +37,7 @@ The MCP server handles device discovery, type resolution, session management, an
 ```bash
 export CCU_HOST=your-ccu-hostname-or-ip
 export CCU_PASSWORD=your-ccu-admin-password
-npx debmatic-mcp --stdio
+npx ccu-mcp --stdio
 ```
 
 If it prints `server_ready` to stderr, it's working. Press Ctrl+C to stop. Now set it up in your MCP client — see below.
@@ -57,7 +57,7 @@ For Claude Code, create a `.mcp.json` file in your project directory (or any dir
   "mcpServers": {
     "debmatic": {
       "command": "npx",
-      "args": ["debmatic-mcp", "--stdio"],
+      "args": ["ccu-mcp", "--stdio"],
       "env": {
         "CCU_HOST": "your-ccu-hostname-or-ip",
         "CCU_PASSWORD": "your-ccu-admin-password"
@@ -74,7 +74,7 @@ Restart Claude Code. Run `/mcp` to check it connected. You should see `debmatic`
 Alternatively, use the Claude Code CLI:
 
 ```bash
-claude mcp add debmatic -- npx debmatic-mcp --stdio
+claude mcp add debmatic -- npx ccu-mcp --stdio
 ```
 
 ### Option B: Docker (standalone HTTP server)
@@ -85,18 +85,18 @@ Use this if you want the server running independently — for example on a home 
 
 ```bash
 docker run -d \
-  --name debmatic-mcp \
+  --name ccu-mcp \
   -e CCU_HOST=your-ccu-hostname-or-ip \
   -e CCU_PASSWORD=your-ccu-admin-password \
-  -v debmatic-data:/data \
+  -v ccu-data:/data \
   -p 3000:3000 \
-  debmatic-mcp
+  ccu-mcp
 ```
 
 **2. Get the auth token.** The server generates a random bearer token on first startup and saves it inside the container's data volume. You need this token to authenticate your MCP client. Grab it with:
 
 ```bash
-docker exec debmatic-mcp grep MCP_AUTH_TOKEN /data/.env
+docker exec ccu-mcp grep MCP_AUTH_TOKEN /data/.env
 ```
 
 This prints something like `MCP_AUTH_TOKEN=e96suzi1iG0H-GPif6K2...`. The part after `=` is your token.
@@ -119,7 +119,7 @@ This prints something like `MCP_AUTH_TOKEN=e96suzi1iG0H-GPif6K2...`. The part af
 To inject the token automatically (requires `jq`):
 
 ```bash
-TOKEN=$(docker exec debmatic-mcp grep MCP_AUTH_TOKEN /data/.env | cut -d= -f2)
+TOKEN=$(docker exec ccu-mcp grep MCP_AUTH_TOKEN /data/.env | cut -d= -f2)
 jq --arg t "$TOKEN" '.mcpServers.debmatic.headers.Authorization = "Bearer " + $t' .mcp.json > .mcp.json.tmp && mv .mcp.json.tmp .mcp.json
 ```
 
@@ -133,7 +133,24 @@ curl http://localhost:3000/health
 
 #### Browser-based clients (CORS)
 
-The HTTP server sends permissive CORS headers and answers `OPTIONS` preflight requests, so browser-based MCP clients like [MCP Inspector](https://github.com/modelcontextprotocol/inspector) can connect directly — no proxy needed. Authentication is still enforced: browsers can read the endpoint, but every MCP request needs the bearer token.
+By default the HTTP server sends **no** CORS headers, so a random web page can't drive a local instance. To let browser-based MCP clients like [MCP Inspector](https://github.com/modelcontextprotocol/inspector) connect directly, set `MCP_ALLOWED_ORIGINS` to a comma-separated allowlist of trusted origins (e.g. `https://app.example,http://localhost:6274`). A request whose `Origin` is on the list gets that **exact** origin reflected in `Access-Control-Allow-Origin` — never the wildcard `*`, which would let any site drive a local instance that controls real CCU hardware. A request from any other origin gets no CORS headers (the browser blocks it) and is rejected server-side by DNS-rebinding protection. Authentication is always enforced regardless: every MCP request needs the bearer token.
+
+The HTTP transport also has **DNS-rebinding protection** on by default: it rejects requests whose `Host` header isn't `localhost`/`127.0.0.1` on the configured port. If you reach the server under another hostname (reverse proxy, container DNS name), list those hosts in `MCP_ALLOWED_HOSTS` or legitimate requests get a `403`.
+
+**TLS.** The bearer token travels in the request, so anything beyond loopback should be encrypted. You have two options: terminate TLS at a reverse proxy (Caddy/nginx) in front and bind the server to loopback (`MCP_HOST=127.0.0.1`), or let the server serve HTTPS itself by setting `MCP_TLS_CERT` and `MCP_TLS_KEY` to a PEM cert/key pair. Plain HTTP is still fully supported — it stays the zero-config default — but the server logs a warning at startup when it's serving the token over unencrypted HTTP on a non-loopback bind; set `MCP_ALLOW_PLAINTEXT=true` to acknowledge that and silence it.
+
+**Token rotation & expiry.** By default the bearer token lives forever. Two optional, composable controls let you rotate it without dropping clients:
+
+- *Auto-generated token* — set `MCP_AUTH_TOKEN_TTL_DAYS` (fractional days allowed) to give the generated token a lifetime. Once it lapses, the server mints a fresh one **on the next startup** and prints it on stderr, while the just-replaced token keeps validating for `MCP_AUTH_TOKEN_GRACE_HOURS` (default 24) so in-flight clients survive the swap. Expiry is also enforced live: a lapsed token is rejected mid-run with a `401` + `WWW-Authenticate: Bearer … error="invalid_token"`. To force a rotation sooner, delete `$CACHE_DIR/.env` (or just its `MCP_AUTH_TOKEN` line) and restart.
+- *Explicit token* — when you set `MCP_AUTH_TOKEN` yourself, you own its lifetime (TTL doesn't apply). To rotate, put the new token in `MCP_AUTH_TOKEN`, move the old one to `MCP_AUTH_TOKEN_PREVIOUS`, and restart; both are accepted during the overlap. Drop `MCP_AUTH_TOKEN_PREVIOUS` and restart once every client is on the new token. Comparison stays timing-safe across every currently-valid token.
+
+**Brute-force protection (fail2ban).** The auto-generated token is 256 bits of randomness, so guessing it is infeasible. If you set `MCP_AUTH_TOKEN` yourself, **make it long and random** (e.g. `openssl rand -base64 32`) — a short or guessable token is the one case brute force matters. The server does **not** rate-limit or lock out failed logins in-process; that job belongs to a firewall-level tool like [fail2ban](https://www.fail2ban.org/), which bans the source IP before the request ever reaches the server. To make that easy, every rejected request logs a structured line to stderr:
+
+```json
+{"ts":"2026-06-18T17:28:00.370Z","level":"warn","msg":"auth_failed","client":"203.0.113.7","hadToken":true}
+```
+
+Ready-to-use fail2ban config ships in [`fail2ban/`](fail2ban/): copy `filter.d/ccu-mcp.conf` to `/etc/fail2ban/filter.d/` and the jail in `jail.d/ccu-mcp.local` to `/etc/fail2ban/jail.d/` (it defaults to 5 failures in 10 minutes → 1-hour ban). The server logs to stderr, so point fail2ban at wherever you collect it — the journal (`backend = systemd`) when run as a unit, or a file when you redirect stderr/`docker logs`; both are spelled out in the jail file. Requires `LOG_LEVEL=warn` or lower (`info`, the default, is fine; `error` suppresses the line). Behind a reverse proxy the logged IP is the proxy's, so run fail2ban against the proxy's access log instead.
 
 CORS support was first implemented by [@marcinn2](https://github.com/marcinn2) in his fork [marcinn2/debmatic-mcp](https://github.com/marcinn2/debmatic-mcp) — thanks!
 
@@ -146,7 +163,16 @@ CCU_HTTPS=true
 CCU_PORT=443
 ```
 
-The server accepts self-signed certificates automatically — certificate verification is **off by default** because CCUs ship with self-signed certs. If your CCU has a proper certificate, enable verification with `CCU_TLS_VERIFY=true`.
+The server accepts self-signed certificates automatically — certificate verification is **off by default** because CCUs ship with self-signed certs (the server logs a warning when running unverified). To actually verify the connection and close the MITM gap, you have three options:
+
+- **Pin the fingerprint** (simplest for a self-signed appliance cert): set `CCU_TLS_FINGERPRINT` to the cert's SHA-256 (hex, with or without colons). The connection is rejected unless the CCU presents exactly that certificate. Read it with:
+  ```bash
+  echo | openssl s_client -connect "$CCU_HOST:443" 2>/dev/null | openssl x509 -noout -fingerprint -sha256
+  ```
+- **Trust a CA/self-signed PEM**: point `CCU_CA_CERT` at the certificate file for standard chain validation.
+- **System trust store**: if your CCU has a publicly-trusted certificate, set `CCU_TLS_VERIFY=true`.
+
+`CCU_TLS_FINGERPRINT` takes precedence over `CCU_CA_CERT`, which takes precedence over `CCU_TLS_VERIFY`.
 
 ## Configuration
 
@@ -159,7 +185,9 @@ All configuration is via environment variables:
 | `CCU_USER` | `Admin` | CCU username |
 | `CCU_PORT` | `80` | API port (`443` when using HTTPS) |
 | `CCU_HTTPS` | `false` | Connect via HTTPS (self-signed certs supported) |
-| `CCU_TLS_VERIFY` | `false` | Verify the CCU's TLS certificate (enable if you have a proper cert) |
+| `CCU_TLS_VERIFY` | `false` | Verify the CCU's TLS certificate against the system trust store (for a publicly-trusted cert) |
+| `CCU_TLS_FINGERPRINT` | unset | Pin the CCU's self-signed leaf cert by its SHA-256 fingerprint (hex, colons optional). Takes precedence over the other TLS options |
+| `CCU_CA_CERT` | unset | Path to the CCU's CA/self-signed PEM for chain validation |
 | `CCU_TIMEOUT` | `10000` | CCU request timeout in milliseconds |
 | `CCU_SCRIPT_TIMEOUT` | `30000` | HM Script execution timeout in milliseconds |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, or `debug` |
@@ -168,21 +196,29 @@ All configuration is via environment variables:
 | `MCP_TRANSPORT` | `http` | `http` or `stdio` (the `--stdio` CLI flag overrides this) |
 | `MCP_PORT` | `3000` | HTTP server port (HTTP mode only) |
 | `MCP_AUTH_TOKEN` | auto-generated | Bearer token for HTTP mode; generated and saved to `$CACHE_DIR/.env` on first start |
+| `MCP_AUTH_TOKEN_PREVIOUS` | unset | Previous bearer token, accepted alongside `MCP_AUTH_TOKEN` during a rotation overlap; remove it (and restart) to end the overlap. Explicit-token path only |
+| `MCP_AUTH_TOKEN_TTL_DAYS` | unset (never expires) | Lifetime of the **auto-generated** token, in days (fractional allowed). Past expiry it auto-rotates on next startup; ignored when `MCP_AUTH_TOKEN` is set |
+| `MCP_AUTH_TOKEN_GRACE_HOURS` | `24` | Overlap (hours) after an auto-rotation during which the just-replaced token is still accepted |
+| `MCP_ALLOWED_ORIGINS` | unset | Comma-separated allowlist of browser origins. Unset = no cross-origin browser access (default-deny). An allowlisted origin is reflected exactly in `Access-Control-Allow-Origin` (never `*`); the list also drives DNS-rebinding origin checks |
+| `MCP_ALLOWED_HOSTS` | `localhost`/`127.0.0.1` | Extra `Host` values accepted by DNS-rebinding protection (comma-separated `host:port`); add your hostname when behind a proxy or container DNS name |
+| `MCP_HOST` | unset (all interfaces) | Bind address for the HTTP listener; set `127.0.0.1` to restrict to loopback (e.g. behind a TLS-terminating proxy), which also silences the plaintext warning |
+| `MCP_TLS_CERT` / `MCP_TLS_KEY` | unset | PEM cert/key paths. Set **both** to serve MCP over HTTPS natively; leave unset for plain HTTP. Setting only one is a configuration error |
+| `MCP_ALLOW_PLAINTEXT` | `false` | Set `true` to acknowledge serving the bearer token over plain HTTP and silence the non-loopback plaintext warning |
 | `CCU_RATE_LIMIT_BURST` | `20` | Max burst of requests sent to the CCU |
 | `CCU_RATE_LIMIT_RATE` | `10` | Sustained CCU requests per second |
 | `RESOURCE_POLL_INTERVAL` | `60` | Seconds between polls for MCP resource change notifications |
 
 ## Tools
 
-18 tools organized by what you'd actually want to do:
+25 tools organized by what you'd actually want to do:
 
-**Find things** — `list_devices`, `list_rooms`, `list_functions`, `list_interfaces`, `list_programs`, `list_system_variables`, `describe_device_type`
+**Find things** — `list_devices`, `list_rooms`, `list_functions`, `list_interfaces`, `list_programs`, `list_system_variables`, `list_links`, `describe_device_type`
 
 **Read state** — `get_value`, `get_values` (bulk), `get_paramset`
 
-**Change things** — `set_value`, `put_paramset`, `set_system_variable`, `execute_program`
+**Change things** — `set_value`, `put_paramset`, `set_system_variable`, `create_system_variable`, `delete_system_variable`, `assign_channel`, `unassign_channel`, `execute_program`
 
-**Check health** — `get_service_messages`, `get_system_info`
+**Check health** — `get_service_messages`, `acknowledge_service_messages`, `get_rssi`, `get_system_info`
 
 **Other** — `help` (context-aware), `run_script` (raw HomeMatic Script for bulk operations, renaming devices/channels, querying room membership, or anything not covered by the other tools)
 
@@ -264,9 +300,9 @@ All dependencies updated to current latest versions:
 
 ## Related projects
 
+- [OpenCCU](https://github.com/OpenCCU/OpenCCU) — community-maintained, cloud-free CCU firmware for Raspberry Pi, x86/ARM, and CCU3/ELV-Charly hardware (formerly **RaspberryMatic**; built on the OCCU framework)
 - [debmatic](https://github.com/alexreinert/debmatic) — Run HomeMatic on Debian, Ubuntu, Raspberry Pi OS, Armbian
-- [OCCU](https://github.com/eq-3/occu) — Open CCU SDK by eQ-3 (the upstream HomeMatic software)
-- [RaspberryMatic](https://github.com/jens-maus/RaspberryMatic) — HomeMatic on Raspberry Pi
+- [OCCU](https://github.com/eq-3/occu) — eQ-3's original Open CCU SDK (the upstream HomeMatic software); now being superseded by the community-maintained [OpenCCU](https://github.com/OpenCCU/OpenCCU)
 - [MCP](https://modelcontextprotocol.io/) — Model Context Protocol specification
 
 ## License

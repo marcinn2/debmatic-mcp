@@ -1,12 +1,12 @@
 {
-  "name": "debmatic-mcp",
-  "version": "1.2.0",
+  "name": "ccu-mcp",
+  "version": "1.5.0",
   "description": "MCP server for controlling HomeMatic smart home devices via the CCU JSON-RPC API",
-  "mcpName": "io.github.claymore666/debmatic-mcp",
+  "mcpName": "io.github.marcinn2/ccu-mcp",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "debmatic-mcp": "dist/index.js"
+    "ccu-mcp": "dist/index.js"
   },
   "files": [
     "dist",
@@ -23,14 +23,16 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "tsc --noEmit && tsc -p tsconfig.test.json",
-    "prepublishOnly": "npm run lint && npm test"
+    "check:versions": "node scripts/check-version-sync.mjs",
+    "version": "node scripts/sync-server-version.mjs && git add server.json",
+    "prepublishOnly": "npm run check:versions && npm run lint && npm test"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=24"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/marcinn2/debmatic-mcp.git"
+    "url": "git+https://github.com/marcinn2/ccu-mcp.git"
   },
   "keywords": [
     "mcp",
@@ -47,12 +49,12 @@
   "author": "claymore666",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/marcinn2/debmatic-mcp/issues"
+    "url": "https://github.com/marcinn2/ccu-mcp/issues"
   },
-  "homepage": "https://github.com/marcinn2/debmatic-mcp#readme",
+  "homepage": "https://github.com/marcinn2/ccu-mcp#readme",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "undici": "^8.4.1",
+    "undici": "^8.5.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
