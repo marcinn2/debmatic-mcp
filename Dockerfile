@@ -12,7 +12,7 @@ COPY scripts/ ./scripts/
 RUN npm run build
 
 FROM node:24-alpine
-LABEL org.opencontainers.image.source="https://github.com/marcinn2/ccu-mcp" \
+LABEL org.opencontainers.image.source="https://github.com/marcinn2/debmatic-mcp" \
       org.opencontainers.image.description="MCP server for controlling HomeMatic smart home devices via the CCU JSON-RPC API" \
       org.opencontainers.image.licenses="MIT"
 WORKDIR /app
