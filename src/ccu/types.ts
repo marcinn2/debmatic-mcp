@@ -27,6 +27,10 @@ export type ErrorCategory =
   | "CCU_ERROR"
   | "TIMEOUT"
   | "UNREACHABLE"
+  // Deterministic TLS verification failure (pin mismatch): deliberately NOT
+  // retriable — re-handshaking with a possibly-MITM'd peer only delays the
+  // security signal.
+  | "TLS_ERROR"
   | "RATE_LIMITED"
   | "INTERNAL";
 
@@ -88,28 +92,34 @@ export interface CcuFunction {
   channelIds: string[];
 }
 
-// CCU program types
+// CCU program types (fields per occu program/getall.tcl — there is NO
+// description field in the response)
 export interface CcuProgram {
   id: string;
   name: string;
-  description: string;
   isActive: boolean;
   isInternal: boolean;
   lastExecuteTime: string;
 }
 
-// CCU system variable types
+// CCU system variable types (fields per occu sysvar/getall.tcl: no
+// description; valueList only for LIST, minValue/maxValue only for NUMBER,
+// valueName0/1 only for LOGIC/ALARM)
 export interface CcuSysVar {
   id: string;
   name: string;
-  description: string;
   type: string;
   value: string;
-  valueList: string;
-  minValue: string;
-  maxValue: string;
   unit: string;
+  channelId: string;
+  isVisible: boolean;
+  isInternal: boolean;
   isLogged: boolean;
+  valueList?: string;
+  minValue?: string;
+  maxValue?: string;
+  valueName0?: string;
+  valueName1?: string;
 }
 
 // CCU interface info
@@ -143,6 +153,26 @@ export interface ParamDescription {
 }
 
 // Config
+/**
+ * A named CCU target (e.g. `prod`, `dev`). Profiles let one server reach
+ * several CCUs; the connection details live in `ccu`, and the two policy flags
+ * gate writes. Built from env in config.ts.
+ */
+export interface CcuProfile {
+  /** Profile name as used by use_ccu / the optional per-call `target` arg. */
+  name: string;
+  /**
+   * Production seatbelt: when true, write tools refuse unless the caller passes
+   * `confirm:true` (which unlocks writes to this target for the rest of the
+   * session). Declared explicitly per profile — never inferred from the name.
+   */
+  protected: boolean;
+  /** When true, write tools are refused outright (even with confirm). */
+  readonly: boolean;
+  /** Connection details for this target. */
+  ccu: CcuConfig;
+}
+
 export interface CcuConfig {
   host: string;
   port: number;

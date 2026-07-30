@@ -4,8 +4,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 export function registerPrompts(server: McpServer): void {
   server.registerPrompt("check-windows", { description: "Check all window/door sensors and report which are open" }, async () => ({
     messages: [{ role: "user" as const, content: { type: "text" as const, text:
-      "Check all window and door sensors using list_devices (filter by type containing 'SWDO' or 'SCI') " +
-      "and get_values. Report which are open and which are closed. Group by room if possible (use list_rooms)."
+      "Check all window and door sensors: call list_devices (no type filter — the type arg is EXACT-match), " +
+      "keep the devices whose type contains 'SWDO' or 'SCI' (e.g. HmIP-SWDO-I), then read them with get_values. " +
+      "Report which are open and which are closed. Group by room if possible (use list_rooms)."
     }}],
   }));
 
@@ -49,7 +50,10 @@ export function registerPrompts(server: McpServer): void {
     messages: [{ role: "user" as const, content: { type: "text" as const, text:
       "Run a diagnostic check on the HomeMatic system:\n" +
       "1. Use get_service_messages to find active issues (low battery, unreachable devices)\n" +
-      "2. Use get_system_info to check firmware and cache status\n" +
+      "2. Use get_system_info to check firmware and cache status. It also reports the active login " +
+      "user and role (ADMIN/USER) — firmware/serial/address are ADMIN-only and show \"N/A\" for a " +
+      "non-admin login — plus the running server's build identification (git branch/commit/tag and " +
+      "build time) under `build`, useful for confirming which version is deployed\n" +
       "3. Summarize findings with recommended actions."
     }}],
   }));

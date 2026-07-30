@@ -40,6 +40,11 @@ describe("loadConfig", () => {
     delete process.env.MCP_TLS_KEY;
     delete process.env.MCP_ALLOW_PLAINTEXT;
     delete process.env.LOG_LEVEL;
+    delete process.env.CCU_PROFILES;
+    delete process.env.CCU_DEFAULT_PROFILE;
+    for (const k of Object.keys(process.env)) {
+      if (/^CCU_(PROD|DEV|STAGING)_/.test(k)) delete process.env[k];
+    }
   });
 
   afterEach(() => {
@@ -185,7 +190,7 @@ describe("loadConfig", () => {
     process.env.CCU_HOST = "test";
     process.env.CCU_PASSWORD = "pw";
     process.env.MCP_PORT = "4567";
-    expect(loadConfig().mcp.allowedHosts).toEqual(["127.0.0.1:4567", "localhost:4567"]);
+    expect(loadConfig().mcp.allowedHosts).toEqual(["127.0.0.1:4567", "localhost:4567", "[::1]:4567"]);
   });
 
   it("MCP_ALLOWED_HOSTS extends the default host allowlist (trimmed, no blanks)", () => {
@@ -196,6 +201,7 @@ describe("loadConfig", () => {
     expect(loadConfig().mcp.allowedHosts).toEqual([
       "127.0.0.1:3000",
       "localhost:3000",
+      "[::1]:3000",
       "mcp.lan:3000",
       "proxy.example",
     ]);
@@ -206,8 +212,20 @@ describe("loadConfig", () => {
     process.env.CCU_PASSWORD = "pw";
     expect(loadConfig().ccu.tlsVerify).toBe(false);
 
+    process.env.CCU_HTTPS = "true";
     process.env.CCU_TLS_VERIFY = "true";
     expect(loadConfig().ccu.tlsVerify).toBe(true);
+  });
+
+  it("rejects TLS settings when HTTPS is disabled (would be silently ignored)", () => {
+    process.env.CCU_HOST = "test";
+    process.env.CCU_PASSWORD = "pw";
+    process.env.CCU_TLS_VERIFY = "true";
+    expect(() => loadConfig()).toThrow(/HTTPS is disabled/);
+
+    delete process.env.CCU_TLS_VERIFY;
+    process.env.CCU_TLS_FINGERPRINT = "AB:CD";
+    expect(() => loadConfig()).toThrow(/HTTPS is disabled/);
   });
 
   // Issue #51: CCU TLS verification via fingerprint pin or CA cert
@@ -222,6 +240,7 @@ describe("loadConfig", () => {
   it("parses CCU_TLS_FINGERPRINT", () => {
     process.env.CCU_HOST = "test";
     process.env.CCU_PASSWORD = "pw";
+    process.env.CCU_HTTPS = "true";
     process.env.CCU_TLS_FINGERPRINT = "AB:CD:EF:01";
     expect(loadConfig().ccu.tlsFingerprint).toBe("AB:CD:EF:01");
   });
@@ -233,6 +252,7 @@ describe("loadConfig", () => {
     try {
       process.env.CCU_HOST = "test";
       process.env.CCU_PASSWORD = "pw";
+      process.env.CCU_HTTPS = "true";
       process.env.CCU_CA_CERT = caPath;
       expect(loadConfig().ccu.caCert).toContain("BEGIN CERTIFICATE");
     } finally {
@@ -319,5 +339,88 @@ describe("loadConfig", () => {
     expect(() => loadConfig()).toThrow(/MCP_AUTH_TOKEN_TTL_DAYS must be a positive number/);
     process.env.MCP_AUTH_TOKEN_TTL_DAYS = "soon";
     expect(() => loadConfig()).toThrow(/MCP_AUTH_TOKEN_TTL_DAYS must be a positive number/);
+  });
+
+  // Issue #69: multiple named CCU targets (profiles)
+  describe("CCU profiles", () => {
+    it("flat config (no CCU_PROFILES) yields a single 'default' profile, ccu alias intact", () => {
+      process.env.CCU_HOST = "debmatic";
+      process.env.CCU_PASSWORD = "secret";
+      const config = loadConfig();
+      expect(config.profiles).toHaveLength(1);
+      expect(config.profiles[0]!.name).toBe("default");
+      expect(config.profiles[0]!.protected).toBe(false);
+      expect(config.profiles[0]!.readonly).toBe(false);
+      expect(config.defaultProfile).toBe("default");
+      // ccu stays an alias of the default profile (back-compat)
+      expect(config.ccu).toBe(config.profiles[0]!.ccu);
+      expect(config.ccu.host).toBe("debmatic");
+      expect(config.ccu.password).toBe("secret");
+    });
+
+    it("builds one profile per CCU_PROFILES entry from CCU_<NAME>_* vars", () => {
+      process.env.CCU_PROFILES = "prod,dev";
+      process.env.CCU_DEFAULT_PROFILE = "prod";
+      process.env.CCU_PROD_HOST = "debmatic";
+      process.env.CCU_PROD_USER = "claude";
+      process.env.CCU_PROD_PASSWORD = "topsecret";
+      process.env.CCU_PROD_HTTPS = "true";
+      process.env.CCU_PROD_PROTECTED = "true";
+      process.env.CCU_DEV_HOST = "127.0.0.1";
+      process.env.CCU_DEV_PORT = "18080";
+      // dev password intentionally unset (OpenCCU default empty)
+
+      const config = loadConfig();
+      expect(config.profiles.map((p) => p.name)).toEqual(["prod", "dev"]);
+      expect(config.defaultProfile).toBe("prod");
+      expect(config.ccu.host).toBe("debmatic"); // alias = default (prod)
+
+      const prod = config.profiles[0]!;
+      expect(prod.protected).toBe(true);
+      expect(prod.ccu.user).toBe("claude");
+      expect(prod.ccu.https).toBe(true);
+      expect(prod.ccu.port).toBe(443); // https default
+
+      const dev = config.profiles[1]!;
+      expect(dev.protected).toBe(false);
+      expect(dev.ccu.host).toBe("127.0.0.1");
+      expect(dev.ccu.port).toBe(18080);
+      expect(dev.ccu.user).toBe("Admin"); // default
+      expect(dev.ccu.password).toBe(""); // empty allowed
+      expect(dev.ccu.https).toBe(false);
+    });
+
+    it("defaults the active profile to the first listed when CCU_DEFAULT_PROFILE is unset", () => {
+      process.env.CCU_PROFILES = "dev,prod";
+      process.env.CCU_DEV_HOST = "127.0.0.1";
+      process.env.CCU_PROD_HOST = "debmatic";
+      expect(loadConfig().defaultProfile).toBe("dev");
+    });
+
+    it("throws if a profile is missing its HOST", () => {
+      process.env.CCU_PROFILES = "prod";
+      // no CCU_PROD_HOST
+      expect(() => loadConfig()).toThrow(/profile "prod" is missing CCU_PROD_HOST/);
+    });
+
+    it("throws if CCU_DEFAULT_PROFILE names an unknown profile", () => {
+      process.env.CCU_PROFILES = "prod";
+      process.env.CCU_PROD_HOST = "debmatic";
+      process.env.CCU_DEFAULT_PROFILE = "dev";
+      expect(() => loadConfig()).toThrow(/CCU_DEFAULT_PROFILE="dev" is not one of CCU_PROFILES/);
+    });
+
+    it("rejects duplicate profile names", () => {
+      process.env.CCU_PROFILES = "prod,Prod";
+      process.env.CCU_PROD_HOST = "debmatic";
+      expect(() => loadConfig()).toThrow(/lists "Prod" more than once/);
+    });
+
+    it("reads per-profile READONLY flag", () => {
+      process.env.CCU_PROFILES = "prod";
+      process.env.CCU_PROD_HOST = "debmatic";
+      process.env.CCU_PROD_READONLY = "true";
+      expect(loadConfig().profiles[0]!.readonly).toBe(true);
+    });
   });
 });

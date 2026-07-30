@@ -4,21 +4,17 @@ import type { ServerDeps } from "../server.js";
 import type { CcuDevice } from "../ccu/types.js";
 import { CcuError } from "../middleware/error-mapper.js";
 import { withRetry } from "../middleware/retry.js";
-import { toolResult, parseValue, escapeHmScript } from "../utils.js";
-
-// Short-lived name→type cache (#9), shared so create/delete can invalidate it
-// and a freshly created/removed variable is reflected on the next set.
-interface SysVarTypeCacheHolder {
-  entry: { ts: number; types: Map<string, string> } | null;
-}
+import { runTool } from "../middleware/tool-handler.js";
+import { assertWritable } from "../ccu/target-registry.js";
+import { toolResult, parseValue, escapeHmScript, expectArray } from "../utils.js";
+import { confirmField } from "./fields.js";
 
 export function registerControlTools(server: McpServer, deps: ServerDeps): void {
-  const sysVarTypeCache: SysVarTypeCacheHolder = { entry: null };
   registerSetValue(server, deps);
   registerPutParamset(server, deps);
-  registerSetSystemVariable(server, deps, sysVarTypeCache);
-  registerCreateSystemVariable(server, deps, sysVarTypeCache);
-  registerDeleteSystemVariable(server, deps, sysVarTypeCache);
+  registerSetSystemVariable(server, deps);
+  registerCreateSystemVariable(server, deps);
+  registerDeleteSystemVariable(server, deps);
   registerExecuteProgram(server, deps);
   registerAssignChannel(server, deps, "add");
   registerAssignChannel(server, deps, "remove");
@@ -39,6 +35,7 @@ function registerSetValue(server: McpServer, deps: ServerDeps): void {
         value: z.union([z.string(), z.number(), z.boolean()]).describe("Value to set"),
         interface: z.string().optional().describe("Interface name override (auto-resolved if omitted)"),
         type: z.enum(["bool", "int", "double", "string"]).optional().describe("Value type override (auto-resolved if omitted)"),
+        confirm: confirmField,
       },
       annotations: {
         destructiveHint: true,
@@ -46,56 +43,61 @@ function registerSetValue(server: McpServer, deps: ServerDeps): void {
         openWorldHint: true,
       },
     },
-    async (args) => {
-      const { session, rateLimiter, logger, deviceTypeCache } = deps;
-      const start = Date.now();
+    async (args) => runTool("set_value", deps.logger, async (log) => {
+      const { rateLimiter, logger } = deps;
+      // Pin the target ONCE: deps.session/resolver are live getters, so a
+      // concurrent use_ccu in this MCP session mid-handler would otherwise
+      // resolve interface/type against a different target than the write.
+      const active = deps.selection.active;
+      const { session, resolver, deviceTypeCache } = active;
+      assertWritable(deps.selection, active, args.confirm);
+      const iface = args.interface ?? await resolver.resolveInterface(args.address, session, rateLimiter, logger);
+      const valueType = args.type ?? resolver.resolveType(args.address, args.valueKey, deviceTypeCache) ?? inferType(args.value);
 
+      // Read previous value (best-effort)
+      let previousValue: unknown = null;
       try {
-        const iface = args.interface ?? await deps.resolver.resolveInterface(args.address, session, rateLimiter, logger);
-        const valueType = args.type ?? deps.resolver.resolveType(args.address, args.valueKey, deviceTypeCache) ?? inferType(args.value);
-
-        // Read previous value (best-effort)
-        let previousValue: unknown = null;
-        try {
-          await rateLimiter.acquire();
-          previousValue = await session.call("Interface.getValue", {
-            interface: iface,
-            address: args.address,
-            valueKey: args.valueKey,
-          });
-        } catch {
-          // Pre-read failed — continue with write
-        }
-
-        // Write new value
         await rateLimiter.acquire();
-        await withRetry(
-          () => session.call("Interface.setValue", {
-            interface: iface,
-            address: args.address,
-            valueKey: args.valueKey,
-            type: valueType,
-            value: args.value,
-          }),
-          "Interface.setValue",
-          logger,
-        );
-
-        logger.info("tool_call", { tool: "set_value", duration_ms: Date.now() - start, status: "ok", address: args.address });
-        return toolResult({
+        previousValue = await session.call("Interface.getValue", {
+          interface: iface,
           address: args.address,
           valueKey: args.valueKey,
-          previousValue: parseValue(previousValue),
-          newValue: args.value,
-          interface: iface,
-          type: valueType,
         });
-      } catch (err) {
-        logger.info("tool_call", { tool: "set_value", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
+      } catch {
+        // Pre-read failed — continue with write
       }
-    },
+
+      // Write new value. An ACTION datapoint (PRESS_SHORT, STOP, ...) is a
+      // one-shot trigger: a timed-out request may still have been delivered,
+      // so auto-retry could fire it twice — send those exactly once. Retry
+      // only when the cache POSITIVELY says the param is not ACTION: on a
+      // cache miss (cold cache, unwarmed target) the param might be a trigger,
+      // and losing one retry is cheaper than double-firing a button press.
+      const rawParamType = resolver.resolveRawParamType(args.address, args.valueKey, deviceTypeCache);
+      const doSetValue = () => session.call("Interface.setValue", {
+        interface: iface,
+        address: args.address,
+        valueKey: args.valueKey,
+        type: valueType,
+        value: args.value,
+      });
+      await rateLimiter.acquire();
+      if (rawParamType !== undefined && rawParamType !== "ACTION") {
+        await withRetry(doSetValue, "Interface.setValue", logger, { rateLimiter });
+      } else {
+        await doSetValue();
+      }
+
+      log({ address: args.address });
+      return toolResult({
+        address: args.address,
+        valueKey: args.valueKey,
+        previousValue: parseValue(previousValue),
+        newValue: args.value,
+        interface: iface,
+        type: valueType,
+      });
+    }),
   );
 }
 
@@ -113,6 +115,7 @@ function registerPutParamset(server: McpServer, deps: ServerDeps): void {
         set: z.record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
           .describe("Key-value pairs to write (e.g. {TEMPERATURE_WINDOW_OPEN: 5.0})"),
         interface: z.string().optional().describe("Interface name override"),
+        confirm: confirmField,
       },
       annotations: {
         destructiveHint: true,
@@ -120,50 +123,56 @@ function registerPutParamset(server: McpServer, deps: ServerDeps): void {
         openWorldHint: true,
       },
     },
-    async (args) => {
-      const { session, rateLimiter, logger, deviceTypeCache } = deps;
-      const start = Date.now();
+    async (args) => runTool("put_paramset", deps.logger, async () => {
+      const { rateLimiter, logger } = deps;
+      // Pin the target once (see set_value).
+      const active = deps.selection.active;
+      const { session, resolver, deviceTypeCache } = active;
+      assertWritable(deps.selection, active, args.confirm);
+      const iface = args.interface ?? await resolver.resolveInterface(args.address, session, rateLimiter, logger);
 
-      try {
-        const iface = args.interface ?? await deps.resolver.resolveInterface(args.address, session, rateLimiter, logger);
+      // CCU expects set as array of {name, type, value} objects. Types must be
+      // resolved against the paramset actually being written — MASTER params
+      // have their own schema; resolving them against VALUES finds nothing and
+      // inferType would e.g. send "int" for a FLOAT param given 5.0.
+      const paramArray = Object.entries(args.set).map(([name, value]) => {
+        let type = resolver.resolveType(args.address, name, deviceTypeCache, args.paramsetKey);
+        if (!type) type = inferType(value);
+        return { name, type, value: String(value) };
+      });
 
-        // CCU expects set as array of {name, type, value} objects
-        const paramArray = Object.entries(args.set).map(([name, value]) => {
-          // Try to resolve type from device type cache
-          let type = deps.resolver.resolveType(args.address, name, deviceTypeCache);
-          if (!type) type = inferType(value);
-          return { name, type, value: String(value) };
-        });
-
-        await rateLimiter.acquire();
-        await withRetry(
-          () => session.call("Interface.putParamset", {
-            interface: iface,
-            address: args.address,
-            paramsetKey: args.paramsetKey,
-            set: paramArray,
-          }),
-          "Interface.putParamset",
-          logger,
-        );
-
-        logger.info("tool_call", { tool: "put_paramset", duration_ms: Date.now() - start, status: "ok" });
-        return toolResult({ address: args.address, paramsetKey: args.paramsetKey, written: args.set });
-      } catch (err) {
-        logger.info("tool_call", { tool: "put_paramset", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
+      // If any written key is (or COULD be, on a cache miss) a one-shot ACTION
+      // trigger, the request must not be auto-retried — a timeout after
+      // delivery would re-fire the trigger. ACTION params only exist in
+      // VALUES; MASTER writes are config and always safe to retry.
+      const safeToRetry = args.paramsetKey === "MASTER" || Object.keys(args.set).every((name) => {
+        const raw = resolver.resolveRawParamType(args.address, name, deviceTypeCache, args.paramsetKey);
+        return raw !== undefined && raw !== "ACTION";
+      });
+      const doPutParamset = () => session.call("Interface.putParamset", {
+        interface: iface,
+        address: args.address,
+        paramsetKey: args.paramsetKey,
+        set: paramArray,
+      });
+      await rateLimiter.acquire();
+      if (safeToRetry) {
+        await withRetry(doPutParamset, "Interface.putParamset", logger, { rateLimiter });
+      } else {
+        await doPutParamset();
       }
-    },
+
+      return toolResult({ address: args.address, paramsetKey: args.paramsetKey, written: args.set });
+    }),
   );
 }
 
 const SYSVAR_TYPE_TTL_MS = 30_000;
 
-function registerSetSystemVariable(server: McpServer, deps: ServerDeps, typeCacheHolder: SysVarTypeCacheHolder): void {
-  // Short-lived name→type cache (shared via the holder): avoids fetching the
-  // full sysvar list on every write. create/delete clear it so new/removed
-  // variables are reflected immediately.
+function registerSetSystemVariable(server: McpServer, deps: ServerDeps): void {
+  // Short-lived name→type cache (per active target): avoids fetching the full
+  // sysvar list on every write. create/delete clear it so new/removed variables
+  // are reflected immediately.
 
   server.registerTool(
     "set_system_variable",
@@ -174,6 +183,7 @@ function registerSetSystemVariable(server: McpServer, deps: ServerDeps, typeCach
       inputSchema: {
         name: z.string().describe("Variable name (exact match)"),
         value: z.union([z.string(), z.number(), z.boolean()]).describe("Value to set"),
+        confirm: confirmField,
       },
       annotations: {
         destructiveHint: true,
@@ -181,88 +191,211 @@ function registerSetSystemVariable(server: McpServer, deps: ServerDeps, typeCach
         openWorldHint: true,
       },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
-
-      try {
-        // Look up variable type (cached) to choose correct setter
-        let method: string;
-        let sysVarType: string | undefined;
-        if (typeCacheHolder.entry && Date.now() - typeCacheHolder.entry.ts < SYSVAR_TYPE_TTL_MS) {
-          sysVarType = typeCacheHolder.entry.types.get(args.name);
+    async (args) => runTool("set_system_variable", deps.logger, async () => {
+      const { rateLimiter, logger } = deps;
+      // Pin the target once (see set_value).
+      const active = deps.selection.active;
+      const { session } = active;
+      const typeCacheHolder = active.sysVarTypeCache;
+      assertWritable(deps.selection, active, args.confirm);
+      // Look up variable type (cached) to choose correct setter
+      let method: string;
+      let sysVar: { type: string; valueList?: string } | undefined;
+      if (typeCacheHolder.entry && Date.now() - typeCacheHolder.entry.ts < SYSVAR_TYPE_TTL_MS) {
+        sysVar = typeCacheHolder.entry.types.get(args.name);
+      }
+      if (sysVar === undefined) {
+        const genBefore = typeCacheHolder.gen;
+        await rateLimiter.acquire();
+        const allVars = await withRetry(
+          () => session.call("SysVar.getAll"),
+          "SysVar.getAll",
+          logger,
+          { rateLimiter },
+        ).then((r) => expectArray<{ name: string; type: string; valueList?: string }>(r));
+        const types = new Map(allVars.map((v) => [v.name, { type: v.type, valueList: v.valueList }]));
+        // Only cache the snapshot if no create/delete invalidated the holder
+        // while we were fetching — installing it would resurrect a pre-delete
+        // view for the next 30s. The snapshot still serves THIS call.
+        if (typeCacheHolder.gen === genBefore) {
+          typeCacheHolder.entry = { ts: Date.now(), types };
         }
-        if (sysVarType === undefined) {
-          await rateLimiter.acquire();
-          const allVars = await withRetry(
-            () => session.call("SysVar.getAll"),
-            "SysVar.getAll",
-            logger,
-          ) as Array<{ name: string; type: string }>;
-          typeCacheHolder.entry = { ts: Date.now(), types: new Map(allVars.map((v) => [v.name, v.type])) };
-          sysVarType = typeCacheHolder.entry.types.get(args.name);
-        }
+        sysVar = types.get(args.name);
+      }
 
-        if (sysVarType !== undefined) {
-          const varType = sysVarType.toUpperCase();
-          if (varType.includes("BOOL") || varType.includes("ALARM")) {
-            method = "SysVar.setBool";
-          } else if (varType.includes("FLOAT") || varType.includes("NUMBER") || varType.includes("INTEGER")) {
-            method = "SysVar.setFloat";
-          } else if (varType.includes("ENUM") || varType.includes("LIST")) {
-            method = "SysVar.setFloat"; // Enums use numeric index
-          } else if (varType.includes("STRING")) {
-            // String variables: use ReGa.runScript as there's no SysVar.setString API
-            await rateLimiter.acquire();
-            const escapedName = escapeHmScript(String(args.name));
-            const escapedValue = escapeHmScript(String(args.value));
-            await withRetry(
-              () => session.call("ReGa.runScript", {
-                script: `var sv = dom.GetObject("${escapedName}"); if (sv) { sv.State("${escapedValue}"); }`,
-              }, deps.config.ccu.scriptTimeout),
-              "ReGa.runScript",
-              logger,
-            );
-            logger.info("tool_call", { tool: "set_system_variable", duration_ms: Date.now() - start, status: "ok" });
-            return toolResult({ name: args.name, value: args.value, method: "ReGa.runScript (string)" });
-          } else {
-            logger.warn("sysvar_unknown_type", { name: args.name, type: sysVarType });
-            throw new CcuError({
-              error: "INVALID_INPUT",
-              code: 0,
-              message: `System variable "${args.name}" has unsupported type: ${sysVarType}`,
-              hint: "Supported types are bool/alarm, float/integer, enum/list, and string.",
-            });
-          }
+      if (sysVar === undefined) {
+        logger.warn("sysvar_not_found", { name: args.name });
+        throw new CcuError({
+          error: "NOT_FOUND",
+          code: 0,
+          message: `System variable not found: ${args.name}`,
+          hint: "Call list_system_variables to see available variables (name must match exactly).",
+        });
+      }
+
+      // SysVar.getAll reports exactly LOGIC / ALARM / LIST / NUMBER / STRING
+      // (occu getall.tcl); the extra aliases keep any older/other firmware
+      // spellings working.
+      const varType = sysVar.type.toUpperCase();
+      let rpcValue: string | number | boolean = args.value;
+      if (varType.includes("LOGIC") || varType.includes("BOOL") || varType.includes("ALARM")) {
+        method = "SysVar.setBool";
+        // setbool.tcl compares non-0/1 values as STRINGS ("false" >= 1 is a
+        // lexicographic compare that yields true), so a JSON boolean false
+        // would be stored as 1. Normalize to numeric 0/1 and reject anything
+        // that isn't clearly a boolean.
+        if (args.value === true || args.value === "true" || args.value === 1 || args.value === "1") {
+          rpcValue = 1;
+        } else if (args.value === false || args.value === "false" || args.value === 0 || args.value === "0") {
+          rpcValue = 0;
         } else {
-          logger.warn("sysvar_not_found", { name: args.name });
+          throw new CcuError({
+            error: "INVALID_INPUT",
+            code: 0,
+            message: `System variable "${args.name}" is boolean; got: ${JSON.stringify(args.value)}`,
+            hint: "Pass true/false (or 0/1).",
+          });
+        }
+      } else if (varType.includes("FLOAT") || varType.includes("NUMBER") || varType.includes("INTEGER")) {
+        method = "SysVar.setFloat";
+        // setfloat.tcl passes the value straight into sv.State() and always
+        // answers success — a non-numeric value would silently store 0.
+        const num = typeof args.value === "number" ? args.value : Number(String(args.value));
+        if (typeof args.value === "boolean" || String(args.value).trim() === "" || !Number.isFinite(num)) {
+          throw new CcuError({
+            error: "INVALID_INPUT",
+            code: 0,
+            message: `System variable "${args.name}" is numeric; got: ${JSON.stringify(args.value)}`,
+            hint: "Pass a finite number.",
+          });
+        }
+        rpcValue = num;
+      } else if (varType.includes("ENUM") || varType.includes("LIST")) {
+        method = "SysVar.setFloat"; // Enums use numeric index
+        // Accept either a 0-based index or one of the enum's labels; anything
+        // else would be forwarded unchecked to sv.State() and store garbage
+        // while the tool reports success. A NUMBER is always an index (the
+        // historical contract) — label matching applies to strings only, so
+        // an enum whose labels are numeric strings ("1;2;3") can't silently
+        // redefine what a numeric input means.
+        const labels = (sysVar.valueList ?? "").split(";");
+        let index: number;
+        if (typeof args.value === "number") {
+          index = args.value;
+        } else {
+          const asLabel = labels.indexOf(String(args.value));
+          index = asLabel >= 0
+            ? asLabel
+            : (/^\d+$/.test(String(args.value)) ? Number(args.value) : NaN);
+        }
+        if (!Number.isInteger(index) || index < 0 || index >= labels.length) {
+          throw new CcuError({
+            error: "INVALID_INPUT",
+            code: 0,
+            message: `Invalid value for enum variable "${args.name}": ${JSON.stringify(args.value)}`,
+            hint: `Pass an index 0-${labels.length - 1} or one of: ${labels.join(", ")}`,
+          });
+        }
+        rpcValue = index;
+      } else if (varType.includes("STRING")) {
+        // String variables: use ReGa.runScript as there's no SysVar.setString API.
+        // Scope the lookup to the sysvar list (a global dom.GetObject name match
+        // could hit a channel/program of the same name) and verify the script
+        // actually ran — empty output means ReGa failed, not success.
+        await rateLimiter.acquire();
+        const escapedName = escapeHmScript(String(args.name));
+        const escapedValue = escapeHmScript(String(args.value));
+        const output = await withRetry(
+          () => session.call("ReGa.runScript", {
+            script:
+              `object sv = dom.GetObject(ID_SYSTEM_VARIABLES).Get("${escapedName}");\n` +
+              `if (sv) { sv.State("${escapedValue}"); WriteLine("OK"); } else { WriteLine("NOT_FOUND"); }`,
+          }, active.profile.ccu.scriptTimeout),
+          "ReGa.runScript",
+          logger,
+          { rateLimiter },
+        );
+        const outcome = typeof output === "string" ? output.trim() : "";
+        if (outcome === "NOT_FOUND") {
           throw new CcuError({
             error: "NOT_FOUND",
             code: 0,
             message: `System variable not found: ${args.name}`,
-            hint: "Call list_system_variables to see available variables (name must match exactly).",
+            hint: "The variable disappeared between lookup and write. Call list_system_variables.",
           });
         }
-
-        await rateLimiter.acquire();
-        await withRetry(
-          () => session.call(method, { name: args.name, value: args.value }),
-          method,
-          logger,
-        );
-
-        logger.info("tool_call", { tool: "set_system_variable", duration_ms: Date.now() - start, status: "ok" });
-        return toolResult({ name: args.name, value: args.value, method });
-      } catch (err) {
-        logger.info("tool_call", { tool: "set_system_variable", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
+        if (outcome !== "OK") {
+          throw new CcuError({
+            error: "CCU_ERROR",
+            code: 0,
+            message: `ReGa script produced no confirmation while setting "${args.name}" — the write may not have happened`,
+            hint: "The CCU's script engine likely failed (busy or errored). Verify with get_value / list_system_variables and retry.",
+          });
+        }
+        return toolResult({ name: args.name, value: args.value, method: "ReGa.runScript (string)" });
+      } else {
+        logger.warn("sysvar_unknown_type", { name: args.name, type: sysVar.type });
+        throw new CcuError({
+          error: "INVALID_INPUT",
+          code: 0,
+          message: `System variable "${args.name}" has unsupported type: ${sysVar.type}`,
+          hint: "Supported types are logic/alarm, number, list, and string.",
+        });
       }
-    },
+
+      await rateLimiter.acquire();
+      await withRetry(
+        () => session.call(method, { name: args.name, value: rpcValue }),
+        method,
+        logger,
+        { rateLimiter },
+      );
+
+      // setbool.tcl/setfloat.tcl answer success even when dom.GetObject finds
+      // no variable (verified in the OCCU TCL) — a delete racing the 30s type
+      // cache would silently no-op. Verify the write had a target: a missing
+      // variable makes getValueByName's script write nothing (""). A TRANSPORT
+      // failure of this extra read must not turn the already-landed write into
+      // a reported error — the result then says the write is unverified.
+      // Trade-off: getValueByName's lookup is global (same as the setters'),
+      // not scoped to ID_SYSTEM_VARIABLES — a scoped check would need
+      // ReGa.runScript, which is ADMIN-only and would break USER-level
+      // logins. Worst case is a false NOT_FOUND on a name collision with an
+      // empty-valued channel/program, never a false success.
+      let verifyResult: unknown;
+      let verified = true;
+      try {
+        await rateLimiter.acquire();
+        verifyResult = await withRetry(
+          () => session.call("SysVar.getValueByName", { name: args.name }),
+          "SysVar.getValueByName",
+          logger,
+          { rateLimiter },
+        );
+      } catch (err) {
+        logger.warn("sysvar_write_unverified", { name: args.name, error: (err as Error).message });
+        verified = false;
+      }
+      if (verified && (typeof verifyResult !== "string" || verifyResult === "")) {
+        throw new CcuError({
+          error: "NOT_FOUND",
+          code: 0,
+          message: `System variable disappeared before the write could land: ${args.name}`,
+          hint: "It was likely deleted concurrently (the CCU's setBool/setFloat report success even without a target). Call list_system_variables to confirm.",
+        });
+      }
+
+      return toolResult({
+        name: args.name,
+        value: rpcValue,
+        method,
+        ...(verified ? {} : { verified: false, note: "The write succeeded but could not be verified (CCU unreachable during verification)." }),
+      });
+    }),
   );
 }
 
-function registerCreateSystemVariable(server: McpServer, deps: ServerDeps, typeCacheHolder: SysVarTypeCacheHolder): void {
+function registerCreateSystemVariable(server: McpServer, deps: ServerDeps): void {
   server.registerTool(
     "create_system_variable",
     {
@@ -279,156 +412,187 @@ function registerCreateSystemVariable(server: McpServer, deps: ServerDeps, typeC
         min: z.number().optional().describe("Minimum value (float only)"),
         max: z.number().optional().describe("Maximum value (float only)"),
         values: z.array(z.string()).optional().describe("Enum value labels in order (enum only, e.g. ['off','low','high'])"),
+        confirm: confirmField,
       },
       annotations: {
         destructiveHint: true,
         openWorldHint: true,
       },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
-
-      try {
-        if (args.type === "enum" && (!args.values || args.values.length === 0)) {
-          throw new CcuError({
-            error: "INVALID_INPUT",
-            code: 0,
-            message: "An enum system variable requires a non-empty 'values' list.",
-            hint: "Pass values, e.g. [\"off\", \"low\", \"high\"].",
-          });
-        }
-
-        // Reject duplicates up front (creating over an existing name corrupts it).
-        await rateLimiter.acquire();
-        const existing = await withRetry(
-          () => session.call("SysVar.getAll"),
-          "SysVar.getAll",
-          logger,
-        ) as Array<{ name: string }>;
-        if (existing.some((v) => v.name === args.name)) {
-          throw new CcuError({
-            error: "INVALID_INPUT",
-            code: 0,
-            message: `System variable already exists: ${args.name}`,
-            hint: "Pick a unique name, or use set_system_variable to change the existing one.",
-          });
-        }
-
-        // Create via ReGa (no SysVar.createString exists, and this keeps all four
-        // types on one code path). Ordering matters and was verified live: set
-        // ValueType + Name + type-specifics, Add(sv.ID()), and only THEN set
-        // ValueUnit/DPInfo — setting those *before* Add makes the CCU store the
-        // variable under a deduplicated " N" name (silent rename). The script
-        // returns the actual stored name so we never report a name we didn't get.
-        const name = escapeHmScript(args.name);
-        const info = escapeHmScript(args.description ?? "");
-        const unit = escapeHmScript(args.unit ?? "");
-        let typeSetup: string;
-        switch (args.type) {
-          case "bool":
-            typeSetup =
-              'sv.ValueType(ivtBinary);\n' +
-              'sv.ValueSubType(istBool);\n' +
-              `sv.Name("${name}");\n` +
-              'sv.ValueName0("false");\n' +
-              'sv.ValueName1("true");\n' +
-              'sv.State(false);';
-            break;
-          case "float": {
-            const min = Number.isFinite(args.min) ? args.min : 0;
-            const max = Number.isFinite(args.max) ? args.max : 100;
-            typeSetup =
-              'sv.ValueType(ivtFloat);\n' +
-              `sv.Name("${name}");\n` +
-              `sv.ValueMin(${min});\n` +
-              `sv.ValueMax(${max});\n` +
-              'sv.State(0);';
-            break;
-          }
-          case "enum": {
-            const list = escapeHmScript((args.values ?? []).join(";"));
-            typeSetup =
-              'sv.ValueType(ivtInteger);\n' +
-              'sv.ValueSubType(istEnum);\n' +
-              `sv.Name("${name}");\n` +
-              `sv.ValueList("${list}");\n` +
-              'sv.State(0);';
-            break;
-          }
-          case "string":
-          default:
-            typeSetup =
-              'sv.ValueType(ivtString);\n' +
-              `sv.Name("${name}");\n` +
-              'sv.State("");';
-            break;
-        }
-
-        // ValueUnit applies to float only; DPInfo (description) to all. Both go
-        // AFTER Add (see comment above).
-        const postAdd =
-          (args.type === "float" ? `sv.ValueUnit("${unit}");\n` : "") +
-          `sv.DPInfo("${info}");`;
-
-        const script =
-          `object oSysVars = dom.GetObject(ID_SYSTEM_VARIABLES);\n` +
-          `object sv = dom.CreateObject(OT_VARDP);\n` +
-          `${typeSetup}\n` +
-          `sv.Internal(false);\n` +
-          `oSysVars.Add(sv.ID());\n` +
-          `${postAdd}\n` +
-          `dom.RTUpdate(false);\n` +
-          `WriteLine(sv.Name());`;
-
-        await rateLimiter.acquire();
-        const createResult = await withRetry(
-          () => session.call("ReGa.runScript", { script }, deps.config.ccu.scriptTimeout),
-          "ReGa.runScript",
-          logger,
-        );
-
-        // The script echoes the ACTUAL stored name. The CCU silently dedups a
-        // requested name against existing similar names (e.g. "X" becomes "X 1"
-        // when an "X 2" already exists), which the exact-match pre-check above
-        // can't see. If we didn't get the name we asked for, undo it and report
-        // the collision rather than leaving a surprise variable behind.
-        const actualName = typeof createResult === "string" && createResult.trim()
-          ? createResult.trim()
-          : args.name;
-        if (actualName !== args.name) {
-          try {
-            await rateLimiter.acquire();
-            await session.call("SysVar.deleteSysVarByName", { name: actualName });
-          } catch { /* best-effort cleanup of the unintended object */ }
-          throw new CcuError({
-            error: "INVALID_INPUT",
-            code: 0,
-            message: `System variable name unavailable: "${args.name}" (the CCU would store it as "${actualName}")`,
-            hint: "Pick a different name — the CCU deduplicates against existing similar names.",
-          });
-        }
-
-        typeCacheHolder.entry = null; // new variable must be visible to the next set
-        logger.info("tool_call", { tool: "create_system_variable", duration_ms: Date.now() - start, status: "ok", type: args.type });
-        return toolResult({ name: actualName, type: args.type, created: true });
-      } catch (err) {
-        logger.info("tool_call", { tool: "create_system_variable", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
+    async (args) => runTool("create_system_variable", deps.logger, async (log) => {
+      const { rateLimiter, logger } = deps;
+      // Pin the target once (see set_value).
+      const active = deps.selection.active;
+      const { session } = active;
+      const typeCacheHolder = active.sysVarTypeCache;
+      assertWritable(deps.selection, active, args.confirm);
+      if (args.type === "enum" && (!args.values || args.values.length === 0)) {
+        throw new CcuError({
+          error: "INVALID_INPUT",
+          code: 0,
+          message: "An enum system variable requires a non-empty 'values' list.",
+          hint: "Pass values, e.g. [\"off\", \"low\", \"high\"].",
+        });
       }
-    },
+      // ";" is the CCU's in-band ValueList separator: a label containing it
+      // would silently split into extra enum states and shift every index
+      // after it. escapeHmScript can't help — the separator is data, not syntax.
+      for (const label of args.values ?? []) {
+        if (label.includes(";")) {
+          throw new CcuError({
+            error: "INVALID_INPUT",
+            code: 0,
+            message: `Enum label ${JSON.stringify(label)} contains ";", the CCU's value-list separator.`,
+            hint: "Rename the label without a semicolon — the CCU cannot represent one inside an enum state name.",
+          });
+        }
+      }
+
+      // Reject duplicates up front (creating over an existing name corrupts it).
+      await rateLimiter.acquire();
+      const existing = await withRetry(
+        () => session.call("SysVar.getAll"),
+        "SysVar.getAll",
+        logger,
+        { rateLimiter },
+      ).then((r) => expectArray<{ name: string }>(r));
+      if (existing.some((v) => v.name === args.name)) {
+        throw new CcuError({
+          error: "INVALID_INPUT",
+          code: 0,
+          message: `System variable already exists: ${args.name}`,
+          hint: "Pick a unique name, or use set_system_variable to change the existing one.",
+        });
+      }
+
+      // Create via ReGa (no SysVar.createString exists, and this keeps all four
+      // types on one code path). Ordering matters and was verified live: set
+      // ValueType + Name + type-specifics, Add(sv.ID()), and only THEN set
+      // ValueUnit/DPInfo — setting those *before* Add makes the CCU store the
+      // variable under a deduplicated " N" name (silent rename). The script
+      // returns the actual stored name so we never report a name we didn't get.
+      const name = escapeHmScript(args.name);
+      const info = escapeHmScript(args.description ?? "");
+      const unit = escapeHmScript(args.unit ?? "");
+      let typeSetup: string;
+      switch (args.type) {
+        case "bool":
+          typeSetup =
+            'sv.ValueType(ivtBinary);\n' +
+            'sv.ValueSubType(istBool);\n' +
+            `sv.Name("${name}");\n` +
+            'sv.ValueName0("false");\n' +
+            'sv.ValueName1("true");\n' +
+            'sv.State(false);';
+          break;
+        case "float": {
+          const min = hmNumberLiteral(Number.isFinite(args.min) ? args.min! : 0, "min");
+          const max = hmNumberLiteral(Number.isFinite(args.max) ? args.max! : 100, "max");
+          typeSetup =
+            'sv.ValueType(ivtFloat);\n' +
+            `sv.Name("${name}");\n` +
+            `sv.ValueMin(${min});\n` +
+            `sv.ValueMax(${max});\n` +
+            'sv.State(0);';
+          break;
+        }
+        case "enum": {
+          const list = escapeHmScript((args.values ?? []).join(";"));
+          typeSetup =
+            'sv.ValueType(ivtInteger);\n' +
+            'sv.ValueSubType(istEnum);\n' +
+            `sv.Name("${name}");\n` +
+            `sv.ValueList("${list}");\n` +
+            'sv.State(0);';
+          break;
+        }
+        case "string":
+        default:
+          typeSetup =
+            'sv.ValueType(ivtString);\n' +
+            `sv.Name("${name}");\n` +
+            'sv.State("");';
+          break;
+      }
+
+      // ValueUnit applies to float only; DPInfo (description) to all. Both go
+      // AFTER Add (see comment above).
+      const postAdd =
+        (args.type === "float" ? `sv.ValueUnit("${unit}");\n` : "") +
+        `sv.DPInfo("${info}");`;
+
+      const script =
+        `object oSysVars = dom.GetObject(ID_SYSTEM_VARIABLES);\n` +
+        `object sv = dom.CreateObject(OT_VARDP);\n` +
+        `${typeSetup}\n` +
+        `sv.Internal(false);\n` +
+        `oSysVars.Add(sv.ID());\n` +
+        `${postAdd}\n` +
+        `dom.RTUpdate(false);\n` +
+        `WriteLine(sv.Name());`;
+
+      await rateLimiter.acquire();
+      const createResult = await withRetry(
+        () => session.call("ReGa.runScript", { script }, active.profile.ccu.scriptTimeout),
+        "ReGa.runScript",
+        logger,
+        { rateLimiter },
+      );
+
+      // The script echoes the ACTUAL stored name. Empty output means the ReGa
+      // script itself failed (hmscript.tcl returns "" on any script error) —
+      // treating that as "created" would report success for a create that
+      // never happened.
+      const actualName = typeof createResult === "string" ? createResult.trim() : "";
+      if (!actualName) {
+        throw new CcuError({
+          error: "CCU_ERROR",
+          code: 0,
+          message: `Create script for "${args.name}" produced no output — the variable was most likely NOT created`,
+          hint: "The CCU's script engine failed (busy or script error). Check with list_system_variables and retry.",
+        });
+      }
+      // The CCU silently dedups a requested name against existing similar names
+      // (e.g. "X" becomes "X 1" when an "X 2" already exists), which the
+      // exact-match pre-check above can't see. If we didn't get the name we
+      // asked for, undo it and report the collision rather than leaving a
+      // surprise variable behind.
+      if (actualName !== args.name) {
+        try {
+          await rateLimiter.acquire();
+          await session.call("SysVar.deleteSysVarByName", { name: actualName });
+        } catch { /* best-effort cleanup of the unintended object */ }
+        // The create+delete pair mutated the sysvar list: invalidate the type
+        // cache here too, or a concurrent set's getAll snapshot taken between
+        // create and cleanup would pass the gen check and cache the phantom
+        // variable for the TTL.
+        typeCacheHolder.entry = null;
+        typeCacheHolder.gen++;
+        throw new CcuError({
+          error: "INVALID_INPUT",
+          code: 0,
+          message: `System variable name unavailable: "${args.name}" (the CCU would store it as "${actualName}")`,
+          hint: "Pick a different name — the CCU deduplicates against existing similar names.",
+        });
+      }
+
+      typeCacheHolder.entry = null; typeCacheHolder.gen++; // new variable must be visible to the next set
+      log({ type: args.type });
+      return toolResult({ name: actualName, type: args.type, created: true });
+    }),
   );
 }
 
-function registerDeleteSystemVariable(server: McpServer, deps: ServerDeps, typeCacheHolder: SysVarTypeCacheHolder): void {
+function registerDeleteSystemVariable(server: McpServer, deps: ServerDeps): void {
   server.registerTool(
     "delete_system_variable",
     {
       title: "Delete System Variable",
-      description: "Delete a system variable by name. Use list_system_variables to see existing names.",
+      description: "Delete a system variable by name. Use list_system_variables to see existing names. " +
+        "On a protected target, EVERY call needs confirm:true — the session unlock from other write tools does not apply.",
       inputSchema: {
         name: z.string().describe("Variable name (exact match)"),
+        confirm: z.boolean().optional().describe("Required true on EVERY call against a protected CCU target (e.g. prod) — deletion never rides on the session unlock."),
       },
       annotations: {
         destructiveHint: true,
@@ -436,44 +600,43 @@ function registerDeleteSystemVariable(server: McpServer, deps: ServerDeps, typeC
         openWorldHint: true,
       },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
-
-      try {
-        // Validate existence so an unknown name is a clean NOT_FOUND rather than
-        // a silent no-op (deleteSysVarByName doesn't report a missing name).
-        await rateLimiter.acquire();
-        const existing = await withRetry(
-          () => session.call("SysVar.getAll"),
-          "SysVar.getAll",
-          logger,
-        ) as Array<{ name: string }>;
-        if (!existing.some((v) => v.name === args.name)) {
-          throw new CcuError({
-            error: "NOT_FOUND",
-            code: 0,
-            message: `System variable not found: ${args.name}`,
-            hint: "Call list_system_variables to see available variables (name must match exactly).",
-          });
-        }
-
-        await rateLimiter.acquire();
-        await withRetry(
-          () => session.call("SysVar.deleteSysVarByName", { name: args.name }),
-          "SysVar.deleteSysVarByName",
-          logger,
-        );
-
-        typeCacheHolder.entry = null; // removed variable must not linger in the cache
-        logger.info("tool_call", { tool: "delete_system_variable", duration_ms: Date.now() - start, status: "ok" });
-        return toolResult({ name: args.name, deleted: true });
-      } catch (err) {
-        logger.info("tool_call", { tool: "delete_system_variable", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
+    async (args) => runTool("delete_system_variable", deps.logger, async () => {
+      const { rateLimiter, logger } = deps;
+      // Pin the target once (see set_value).
+      const active = deps.selection.active;
+      const { session } = active;
+      const typeCacheHolder = active.sysVarTypeCache;
+      // Destructive and unrecoverable — per-call confirm (#72)
+      assertWritable(deps.selection, active, args.confirm, { alwaysConfirm: true });
+      // Validate existence so an unknown name is a clean NOT_FOUND rather than
+      // a silent no-op (deleteSysVarByName doesn't report a missing name).
+      await rateLimiter.acquire();
+      const existing = await withRetry(
+        () => session.call("SysVar.getAll"),
+        "SysVar.getAll",
+        logger,
+        { rateLimiter },
+      ).then((r) => expectArray<{ name: string }>(r));
+      if (!existing.some((v) => v.name === args.name)) {
+        throw new CcuError({
+          error: "NOT_FOUND",
+          code: 0,
+          message: `System variable not found: ${args.name}`,
+          hint: "Call list_system_variables to see available variables (name must match exactly).",
+        });
       }
-    },
+
+      await rateLimiter.acquire();
+      await withRetry(
+        () => session.call("SysVar.deleteSysVarByName", { name: args.name }),
+        "SysVar.deleteSysVarByName",
+        logger,
+        { rateLimiter },
+      );
+
+      typeCacheHolder.entry = null; typeCacheHolder.gen++; // removed variable must not linger in the cache
+      return toolResult({ name: args.name, deleted: true });
+    }),
   );
 }
 
@@ -494,6 +657,7 @@ function registerAssignChannel(server: McpServer, deps: ServerDeps, mode: "add" 
         channel: z.string().describe("Channel address (e.g. '000A1BE9A71F15:1')"),
         room: z.string().optional().describe("Room name (exact match)"),
         function: z.string().optional().describe("Function group name (exact match)"),
+        confirm: confirmField,
       },
       annotations: {
         destructiveHint: true,
@@ -501,76 +665,82 @@ function registerAssignChannel(server: McpServer, deps: ServerDeps, mode: "add" 
         openWorldHint: true,
       },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
+    async (args) => runTool(toolName, deps.logger, async () => {
+      const { rateLimiter, logger } = deps;
+      // Pin the target once (see set_value).
+      const active = deps.selection.active;
+      const { session } = active;
+      assertWritable(deps.selection, active, args.confirm);
+      if (!args.room && !args.function) {
+        throw new CcuError({
+          error: "INVALID_INPUT",
+          code: 0,
+          message: "Provide a room and/or a function to assign the channel to.",
+          hint: "Pass room and/or function by name (see list_rooms / list_functions).",
+        });
+      }
 
-      try {
-        if (!args.room && !args.function) {
-          throw new CcuError({
-            error: "INVALID_INPUT",
-            code: 0,
-            message: "Provide a room and/or a function to assign the channel to.",
-            hint: "Pass room and/or function by name (see list_rooms / list_functions).",
-          });
-        }
+      // Resolve the channel address → channel ID (the membership APIs take IDs).
+      await rateLimiter.acquire();
+      const devices = await withRetry(
+        () => session.call("Device.listAllDetail"),
+        "Device.listAllDetail",
+        logger,
+        { rateLimiter },
+      ).then((r) => expectArray<CcuDevice>(r));
+      active.resolver.updateDeviceList(devices);
+      let channelId: string | undefined;
+      for (const d of devices) {
+        const ch = d.channels.find((c) => c.address === args.channel);
+        if (ch) { channelId = ch.id; break; }
+      }
+      if (!channelId) {
+        throw new CcuError({
+          error: "NOT_FOUND",
+          code: 0,
+          message: `Channel not found: ${args.channel}`,
+          hint: "Call list_devices to find valid channel addresses.",
+        });
+      }
 
-        // Resolve the channel address → channel ID (the membership APIs take IDs).
+      const applied: Array<{ kind: "room" | "function"; name: string }> = [];
+
+      if (args.room) {
         await rateLimiter.acquire();
-        const devices = await withRetry(
-          () => session.call("Device.listAllDetail"),
-          "Device.listAllDetail",
+        const rooms = await withRetry(
+          () => session.call("Room.getAll"),
+          "Room.getAll",
           logger,
-        ) as CcuDevice[];
-        deps.resolver.updateDeviceList(devices);
-        let channelId: string | undefined;
-        for (const d of devices) {
-          const ch = d.channels.find((c) => c.address === args.channel);
-          if (ch) { channelId = ch.id; break; }
-        }
-        if (!channelId) {
+          { rateLimiter },
+        ).then((r) => expectArray<{ id: string; name: string }>(r));
+        const room = rooms.find((r) => r.name === args.room);
+        if (!room) {
           throw new CcuError({
             error: "NOT_FOUND",
             code: 0,
-            message: `Channel not found: ${args.channel}`,
-            hint: "Call list_devices to find valid channel addresses.",
+            message: `Room not found: ${args.room}`,
+            hint: `Valid rooms: ${rooms.map((r) => r.name).join(", ")}`,
           });
         }
+        await rateLimiter.acquire();
+        await withRetry(
+          () => session.call(mode === "add" ? "Room.addChannel" : "Room.removeChannel", { id: room.id, channelId }),
+          "Room.modifyChannel",
+          logger,
+          { rateLimiter },
+        );
+        applied.push({ kind: "room", name: room.name });
+      }
 
-        const applied: Array<{ kind: "room" | "function"; name: string }> = [];
-
-        if (args.room) {
-          await rateLimiter.acquire();
-          const rooms = await withRetry(
-            () => session.call("Room.getAll"),
-            "Room.getAll",
-            logger,
-          ) as Array<{ id: string; name: string }>;
-          const room = rooms.find((r) => r.name === args.room);
-          if (!room) {
-            throw new CcuError({
-              error: "NOT_FOUND",
-              code: 0,
-              message: `Room not found: ${args.room}`,
-              hint: `Valid rooms: ${rooms.map((r) => r.name).join(", ")}`,
-            });
-          }
-          await rateLimiter.acquire();
-          await withRetry(
-            () => session.call(mode === "add" ? "Room.addChannel" : "Room.removeChannel", { id: room.id, channelId }),
-            "Room.modifyChannel",
-            logger,
-          );
-          applied.push({ kind: "room", name: room.name });
-        }
-
-        if (args.function) {
+      if (args.function) {
+        try {
           await rateLimiter.acquire();
           const functions = await withRetry(
             () => session.call("Subsection.getAll"),
             "Subsection.getAll",
             logger,
-          ) as Array<{ id: string; name: string }>;
+            { rateLimiter },
+          ).then((r) => expectArray<{ id: string; name: string }>(r));
           const fn = functions.find((f) => f.name === args.function);
           if (!fn) {
             throw new CcuError({
@@ -585,21 +755,29 @@ function registerAssignChannel(server: McpServer, deps: ServerDeps, mode: "add" 
             () => session.call(mode === "add" ? "Subsection.addChannel" : "Subsection.removeChannel", { id: fn.id, channelId }),
             "Subsection.modifyChannel",
             logger,
+            { rateLimiter },
           );
           applied.push({ kind: "function", name: fn.name });
+        } catch (err) {
+          // The room step may already have been applied — a bare error would
+          // hide that partial state and invite a double-applying retry.
+          if (applied.length > 0 && err instanceof CcuError) {
+            throw new CcuError({
+              ...err.structured,
+              message:
+                `${err.structured.message} — NOTE: the room ` +
+                `${mode === "add" ? "assignment" : "removal"} ("${applied[0]!.name}") was already applied`,
+            });
+          }
+          throw err;
         }
-
-        logger.info("tool_call", { tool: toolName, duration_ms: Date.now() - start, status: "ok" });
-        return toolResult({
-          channel: args.channel,
-          [mode === "add" ? "assignedTo" : "removedFrom"]: applied,
-        });
-      } catch (err) {
-        logger.info("tool_call", { tool: toolName, duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
       }
-    },
+
+      return toolResult({
+        channel: args.channel,
+        [mode === "add" ? "assignedTo" : "removedFrom"]: applied,
+      });
+    }),
   );
 }
 
@@ -613,49 +791,75 @@ function registerExecuteProgram(server: McpServer, deps: ServerDeps): void {
         "Use list_programs to find program IDs.",
       inputSchema: {
         id: z.string().describe("Program ID. Get from list_programs."),
+        confirm: confirmField,
       },
       annotations: {
         destructiveHint: true,
         openWorldHint: true,
       },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
+    async (args) => runTool("execute_program", deps.logger, async () => {
+      const { rateLimiter, logger } = deps;
+      // Pin the target once (see set_value).
+      const active = deps.selection.active;
+      const { session } = active;
+      assertWritable(deps.selection, active, args.confirm);
+      // The CCU's Program.execute reports success even for nonexistent IDs
+      // (issue #18) — validate against the program list first.
+      await rateLimiter.acquire();
+      const programs = await withRetry(
+        () => session.call("Program.getAll"),
+        "Program.getAll",
+        logger,
+        { rateLimiter },
+      ).then((r) => expectArray<{ id: string; name: string }>(r));
 
-      try {
-        // The CCU's Program.execute reports success even for nonexistent IDs
-        // (issue #18) — validate against the program list first.
-        await rateLimiter.acquire();
-        const programs = await withRetry(
-          () => session.call("Program.getAll"),
-          "Program.getAll",
-          logger,
-        ) as Array<{ id: string; name: string }>;
-
-        const program = programs.find((p) => String(p.id) === args.id);
-        if (!program) {
-          throw new CcuError({
-            error: "NOT_FOUND",
-            code: 0,
-            message: `Program not found: ${args.id}`,
-            hint: "Call list_programs to see available programs and their IDs.",
-          });
-        }
-
-        await rateLimiter.acquire();
-        // No retry — Program.execute is not idempotent
-        await session.call("Program.execute", { id: args.id });
-
-        logger.info("tool_call", { tool: "execute_program", duration_ms: Date.now() - start, status: "ok" });
-        return toolResult({ id: args.id, name: program.name, executed: true });
-      } catch (err) {
-        logger.info("tool_call", { tool: "execute_program", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
+      const program = programs.find((p) => String(p.id) === args.id);
+      if (!program) {
+        throw new CcuError({
+          error: "NOT_FOUND",
+          code: 0,
+          message: `Program not found: ${args.id}`,
+          hint: "Call list_programs to see available programs and their IDs.",
+        });
       }
-    },
+
+      await rateLimiter.acquire();
+      // No retry — Program.execute is not idempotent.
+      // execute.tcl answers `false` (not an error) when the ReGa script fails
+      // or ProgramExecute() didn't run — that must not read as success.
+      const executed = await session.call("Program.execute", { id: args.id });
+      if (executed !== true && executed !== "true") {
+        throw new CcuError({
+          error: "CCU_ERROR",
+          code: 0,
+          message: `Program.execute reported failure for program ${args.id} ("${program.name}")`,
+          hint: "The CCU's script engine failed or the program vanished. Check list_programs and the CCU logs, then retry.",
+        });
+      }
+
+      return toolResult({ id: args.id, name: program.name, executed: true });
+    }),
   );
+}
+
+/**
+ * Render a number as a HomeMatic Script numeric literal. JS stringification
+ * uses exponent notation for extreme magnitudes ("1e-7", "1e+21"), which ReGa
+ * cannot parse — the whole script would fail. Reject those instead of emitting
+ * a broken script.
+ */
+function hmNumberLiteral(n: number, field: string): string {
+  const s = String(n);
+  if (!/^-?\d+(\.\d+)?$/.test(s)) {
+    throw new CcuError({
+      error: "INVALID_INPUT",
+      code: 0,
+      message: `Value for "${field}" (${s}) cannot be written as a HomeMatic Script number literal`,
+      hint: "Use a plain decimal magnitude (no exponent notation).",
+    });
+  }
+  return s;
 }
 
 export function inferType(value: unknown): string {

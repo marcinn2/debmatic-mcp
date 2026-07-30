@@ -1,7 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerDeps } from "../server.js";
-import { CcuError } from "../middleware/error-mapper.js";
+import { runTool } from "../middleware/tool-handler.js";
+import { assertWritable } from "../ccu/target-registry.js";
 import { toolResult } from "../utils.js";
 
 export function registerMetaTools(server: McpServer, deps: ServerDeps): void {
@@ -28,13 +29,31 @@ CCU → Interfaces → Devices → Channels → Datapoints (paramsets)
 ## Paramsets
 - **VALUES** — Runtime state (temperature, switch state, valve position)
 - **MASTER** — Device configuration (reporting interval, display settings)
-- **LINK** — Direct peering configuration
+- **Link parameters** — Direct peering configuration. Read them with
+  \`get_paramset\` by passing the link PARTNER's channel address as
+  \`paramsetKey\` (find partners with \`list_links\`) — the literal key
+  "LINK" is not valid on the CCU.
 
 ## Typical Workflow
 1. \`list_devices\` → find device types and channel addresses
 2. \`describe_device_type\` → learn datapoints, types, ranges (from cache)
 3. \`get_value\` / \`get_values\` / \`get_paramset\` → read current state
 4. \`set_value\` / \`put_paramset\` → change state (returns previous value)
+
+## CCU Targets (prod / dev)
+This server can be configured with several named CCU targets (profiles). One is
+"active" at a time; tools run against it.
+- \`list_ccu_targets\` — see configured targets (name, host, user, protected/active)
+- \`get_connection_info\` — confirm which target is active (do this before a write!)
+- \`use_ccu\` — switch the active target
+- Read tools accept an optional \`target\` arg to read from another target for one
+  call without switching (e.g. compare prod vs dev).
+- A \`protected\` target (e.g. prod) refuses writes unless you pass \`confirm: true\`
+  once — that unlocks writes to it for the rest of the session.
+- Exception: \`run_script\` and \`delete_system_variable\` require \`confirm: true\`
+  on EVERY call against a protected target. They never ride on the session
+  unlock (scripts bypass all typed-tool guards; deletion is unrecoverable),
+  and confirming them does not unlock the session for other writes.
 
 ## Tips
 - Use \`list_devices\` with room/function filters to reduce output
@@ -49,122 +68,143 @@ CCU → Interfaces → Devices → Channels → Datapoints (paramsets)
 **Read:** get_value, get_values, get_paramset
 **Control:** set_value, put_paramset, set_system_variable, create_system_variable, delete_system_variable, assign_channel, unassign_channel, execute_program
 **Diagnostics:** get_service_messages, acknowledge_service_messages, get_rssi, get_system_info
+**Targets:** list_ccu_targets, get_connection_info, use_ccu
 **Meta:** help, run_script
 `;
 
 const TOOL_HELP: Record<string, string> = {
   list_devices: `List all devices with channels, types, and addresses.
-Args: room? (string), function? (string), type? (string), name? (string)
+Args: room? (string), function? (string), type? (string, EXACT match), name? (string, substring), target? (CCU target name)
+Room + function together filter as AND (channels in that room AND that function).
 Returns compact summary when unfiltered (address, name, type, channel names only).
 Returns full details (all channel properties) when any filter is applied.
 Related: describe_device_type, get_value`,
 
   list_interfaces: `List available communication interfaces.
-Args: none
+Args: target? (CCU target name)
 Returns: Array of {name, port, info}`,
 
   list_rooms: `List all rooms with assigned channel IDs.
-Args: none
+Args: target? (CCU target name)
 Returns: Array of rooms`,
 
   list_functions: `List all function groups with assigned channel IDs.
-Args: none
+Args: target? (CCU target name)
 Returns: Array of function groups`,
 
   list_programs: `List automation programs.
-Args: name? (substring filter)
+Args: name? (substring filter), target? (CCU target name)
 Returns: Array of programs with id, name, active state`,
 
   list_system_variables: `List system variables with current values.
-Args: name? (substring filter)
+Args: name? (substring filter), target? (CCU target name)
 Returns: Array of variables with id, name, value, type, min, max`,
 
   describe_device_type: `Get channel/datapoint schema for a device type (from cache).
-Args: deviceType (string, e.g. "HmIP-eTRV-2")
+Args: deviceType (string, e.g. "HmIP-eTRV-2"), target? (CCU target name)
 Returns: Channels with paramsets, datapoint types, ranges, operations`,
 
   list_links: `List direct device links (Direktverknüpfungen) — sender→receiver channel pairings that work without the CCU.
-Args: address? (device or channel address filter, e.g. "000A1BE9A71F15" or "000A1BE9A71F15:1")
+Args: address? (device or channel address filter, e.g. "000A1BE9A71F15" or "000A1BE9A71F15:1"), target? (CCU target name)
 Returns: Array of {sender, senderName, receiver, receiverName, name, description, flags, interface}
 Read-only; answers "what directly controls this?". Link creation/removal is out of scope.`,
 
   get_value: `Read a single datapoint value.
-Args: address (string), valueKey (string), interface? (auto-resolved)
+Args: address (string), valueKey (string), interface? (auto-resolved), target? (CCU target name)
 Returns: {address, valueKey, value}
 Idempotent: yes`,
 
   get_values: `Bulk read datapoints for multiple channels.
-Args: channels? (string[]), room? (string), function? (string)
+Args: channels? (string[]), room? (string), function? (string), target? (CCU target name)
 Returns: Array of {address, name, datapoints}
 Idempotent: yes`,
 
   get_paramset: `Read all parameters for a channel.
-Args: address (string), paramsetKey ("VALUES"|"MASTER"|"LINK"), interface? (auto-resolved)
+Args: address (string), paramsetKey ("VALUES" | "MASTER" | a link partner's channel address for that link's parameters), interface? (auto-resolved), target? (CCU target name)
 Returns: {address, paramsetKey, params}
 Idempotent: yes`,
 
   set_value: `Set a single datapoint value. Returns previous value for undo.
-Args: address (string), valueKey (string), value (string|number|boolean), interface? (auto), type? (auto)
+Args: address (string), valueKey (string), value (string|number|boolean), interface? (auto), type? (auto), confirm? (true to authorize on a protected target)
 Returns: {previousValue, newValue, address, valueKey}
 Idempotent: yes`,
 
   put_paramset: `Write multiple parameters at once.
-Args: address (string), paramsetKey ("VALUES"|"MASTER"), set (object with key:value pairs, e.g. {"TEMPERATURE_WINDOW_OPEN": 5.0}), interface? (auto)
+Args: address (string), paramsetKey ("VALUES"|"MASTER"), set (object with key:value pairs, e.g. {"TEMPERATURE_WINDOW_OPEN": 5.0}), interface? (auto), confirm? (true to authorize on a protected target)
 The set object uses simple key:value format — types are auto-resolved from the device type cache. Values are converted to strings internally.
 Returns: {address, paramsetKey, written}
 Idempotent: yes`,
 
   set_system_variable: `Set a system variable (type auto-detected).
-Args: name (string), value (string|number|boolean)
+Args: name (string), value (string|number|boolean), confirm? (true to authorize on a protected target)
+Enum (LIST) variables accept a 0-based index or one of the enum's labels.
 Returns: {name, value, method}
 Idempotent: yes`,
 
   create_system_variable: `Create a new system variable.
 Args: name (string), type ("bool"|"float"|"enum"|"string"), description? (string),
-  unit?/min?/max? (float only), values? (string[], required for enum)
+  unit?/min?/max? (float only), values? (string[], required for enum; labels must not contain ";"),
+  confirm? (true to authorize on a protected target)
 Returns: {name, type, created: true}
 INVALID_INPUT if the name already exists (or enum without values). Use set_system_variable to write it.`,
 
   delete_system_variable: `Delete a system variable by name.
-Args: name (string, exact match)
+Args: name (string, exact match), confirm (REQUIRED true on every call against a protected target — never rides on the session unlock)
 Returns: {name, deleted: true}
 NOT_FOUND if the name doesn't exist.`,
 
   assign_channel: `Assign a channel to a room and/or function group.
-Args: channel (address), room? (name), function? (name) — at least one of room/function
+Args: channel (address), room? (name), function? (name) — at least one of room/function; confirm? (true to authorize on a protected target)
 Returns: {channel, assignedTo: [{kind, name}]}
 NOT_FOUND (with valid names) for unknown channel/room/function.`,
 
   unassign_channel: `Remove a channel from a room and/or function group.
-Args: channel (address), room? (name), function? (name) — at least one of room/function
+Args: channel (address), room? (name), function? (name) — at least one of room/function; confirm? (true to authorize on a protected target)
 Returns: {channel, removedFrom: [{kind, name}]}
 NOT_FOUND (with valid names) for unknown channel/room/function.`,
 
   execute_program: `Trigger an automation program. NOT idempotent — never auto-retried.
-Args: id (string)
+Args: id (string), confirm? (true to authorize on a protected target)
 Returns: {id, executed}`,
 
   get_service_messages: `Get active service messages (low battery, unreachable, etc.).
-Args: none
-Returns: Array of {id, name, address, channelName, timestamp}`,
+Args: target? (CCU target name)
+Returns: Array of {id, type, address, channelName, timestamp} — type is the alarm datapoint name (e.g. LOWBAT, UNREACH)`,
 
   acknowledge_service_messages: `Confirm/dismiss active service messages (e.g. clear a low-battery warning).
-Args: id (single alarm id from get_service_messages) OR address (all active messages on a channel) — at least one required
+Args: id (single alarm id from get_service_messages) OR address (all active messages on a channel) — at least one required; confirm? (true to authorize on a protected target)
 Returns: {confirmed: Array of {id, type, address}, count}
 NOT_FOUND if no active message matches; the warning reappears if its condition persists.`,
 
-  get_system_info: `Get CCU system info: firmware, serial, addresses, cache status.
-Args: none
-Returns: {version, serial, address, hmipAddress, cacheTypes, cacheWarming}`,
+  get_system_info: `Get CCU system info plus server identity: active target, login user, inferred role, build.
+Args: target? (CCU target name)
+Returns: {serverVersion, target, user, role (ADMIN|USER|UNKNOWN), version, serial, address, hmipAddress,
+  accessNote? (present when ADMIN-only fields are unavailable), cacheTypes, cacheWarming, build {branch, commit, tag, describe, dirty, builtAt}}
+version/serial/address/hmipAddress are ADMIN-only on the CCU and show "N/A" for a USER-level login.`,
 
   get_rssi: `Radio link quality (RSSI, dBm) per device, plus BidCos interface health.
-Args: name (optional substring filter on device name/address)
+Args: name? (substring filter on device name/address), target? (CCU target name)
 Returns: {devices: [{address, name, interface, links: [{peer, peerName, rssiDevice, rssiPeer}]}], interfaces}
 rssiDevice/rssiPeer are dBm (higher = better); null means no measurement. Use to diagnose flaky devices.`,
 
   run_script: `Execute arbitrary HomeMatic Script. NOT idempotent — never auto-retried.
-Args: script (string)
+Args: script (string), confirm (REQUIRED true on every call against a protected target — scripts bypass all typed-tool guards and never ride on the session unlock)
 Returns: Script output`,
+
+  list_ccu_targets: `List configured CCU targets (profiles) you can switch between.
+Args: none
+Returns: {targets: [{name, host, port, user, https, protected, readonly, active, loggedIn}], active}
+Never exposes passwords.`,
+
+  get_connection_info: `Report the active CCU target (host, user, https, protected/readonly, login state).
+Args: none
+Returns: {name, host, port, user, https, protected, readonly, active, loggedIn, writesUnlocked}
+Use before a write to confirm WHERE it will run.`,
+
+  use_ccu: `Switch the active CCU target. Subsequent calls run against it.
+Args: profile (string — see list_ccu_targets)
+Returns: the new active connection info
+For a one-off read elsewhere, prefer the per-call \`target\` arg on read tools instead.`,
 
   help: `Context-aware help. No args = guide, tool name = tool docs, device type = schema.
 Args: topic? (string)`,
@@ -190,8 +230,9 @@ function registerHelp(server: McpServer, deps: ServerDeps): void {
         return toolResult(CONCEPTUAL_GUIDE);
       }
 
-      // Check if it's a tool name
-      if (args.topic in TOOL_HELP) {
+      // Check if it's a tool name (hasOwn: `in` would match Object.prototype
+      // keys, so help("constructor") would print native-code source)
+      if (Object.hasOwn(TOOL_HELP, args.topic)) {
         return toolResult(`# ${args.topic}\n\n${TOOL_HELP[args.topic]}`);
       }
 
@@ -219,31 +260,30 @@ function registerRunScript(server: McpServer, deps: ServerDeps): void {
       description:
         "Execute arbitrary HomeMatic Script on the CCU. " +
         "NOT idempotent — will not be auto-retried. " +
-        "Use for anything the other tools don't cover.",
+        "Use for anything the other tools don't cover. " +
+        "On a protected target, EVERY call needs confirm:true — the session unlock from other write tools does not apply.",
       inputSchema: {
         script: z.string().describe("HomeMatic Script to execute"),
+        confirm: z.boolean().optional().describe("Required true on EVERY call against a protected CCU target (e.g. prod) — scripts never ride on the session unlock."),
       },
       annotations: {
         destructiveHint: true,
         openWorldHint: true,
       },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
+    async (args) => runTool("run_script", deps.logger, async () => {
+      const { rateLimiter } = deps;
+      // Pin the target once so a concurrent use_ccu can't split the guard,
+      // session, and timeout across different targets mid-handler.
+      const active = deps.selection.active;
+      const { session } = active;
+      // Scripts bypass every guard the typed tools enforce — per-call confirm (#72)
+      assertWritable(deps.selection, active, args.confirm, { alwaysConfirm: true });
+      await rateLimiter.acquire();
+      // No retry — scripts are not idempotent
+      const result = await session.call("ReGa.runScript", { script: args.script }, active.profile.ccu.scriptTimeout);
 
-      try {
-        await rateLimiter.acquire();
-        // No retry — scripts are not idempotent
-        const result = await session.call("ReGa.runScript", { script: args.script }, deps.config.ccu.scriptTimeout);
-
-        logger.info("tool_call", { tool: "run_script", duration_ms: Date.now() - start, status: "ok" });
-        return toolResult(result);
-      } catch (err) {
-        logger.info("tool_call", { tool: "run_script", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
-      }
-    },
+      return toolResult(result);
+    }),
   );
 }

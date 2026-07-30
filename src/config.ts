@@ -1,8 +1,17 @@
 import { readFileSync } from "node:fs";
-import type { CcuConfig } from "./ccu/types.js";
+import type { CcuConfig, CcuProfile } from "./ccu/types.js";
 
 export interface AppConfig {
+  /**
+   * Connection details for the DEFAULT target. Kept as an alias of
+   * `profiles[defaultProfile].ccu` for back-compat with code/tests that read
+   * `config.ccu.*` (e.g. `scriptTimeout`). Prefer `profiles` for new code.
+   */
   ccu: CcuConfig;
+  /** All configured CCU targets (always ≥1; a flat config yields one `default`). */
+  profiles: CcuProfile[];
+  /** Name of the target active at startup. */
+  defaultProfile: string;
   mcp: {
     transport: "http" | "stdio";
     port: number;
@@ -18,7 +27,8 @@ export interface AppConfig {
      * Lifetime of the AUTO-GENERATED bearer token in ms (`MCP_AUTH_TOKEN_TTL_DAYS`,
      * fractional days allowed). Unset ⇒ the generated token never expires (the
      * historical default). Does not apply to an explicit `MCP_AUTH_TOKEN`, which
-     * the operator owns. On startup past expiry the token auto-rotates.
+     * the operator owns. The token auto-rotates AT RUNTIME shortly before
+     * expiry (and on startup if it expired while the server was down).
      */
     authTokenTtlMs?: number;
     /**
@@ -76,19 +86,15 @@ export interface AppConfig {
 }
 
 export function loadConfig(): AppConfig {
-  const host = process.env.CCU_HOST;
-  if (!host) {
-    throw new Error("CCU_HOST environment variable is required");
-  }
-
-  const password = process.env.CCU_PASSWORD;
-  if (!password) {
-    throw new Error("CCU_PASSWORD environment variable is required");
-  }
-
-  // CLI flags override env vars for transport
+  // CLI flags override env vars for transport. Validate the env value: a typo
+  // ("STDIO", "Stdio") must fail loudly, not silently select HTTP and leave a
+  // stdio-spawning client hanging forever.
   const args = process.argv.slice(2);
-  let transport: "http" | "stdio" = (process.env.MCP_TRANSPORT as "http" | "stdio") || "http";
+  const transportEnv = process.env.MCP_TRANSPORT?.trim().toLowerCase();
+  if (transportEnv && transportEnv !== "http" && transportEnv !== "stdio") {
+    throw new Error(`MCP_TRANSPORT must be "http" or "stdio", got: "${process.env.MCP_TRANSPORT}"`);
+  }
+  let transport: "http" | "stdio" = (transportEnv as "http" | "stdio" | undefined) || "http";
   if (args.includes("--stdio")) transport = "stdio";
   if (args.includes("--http")) transport = "http";
 
@@ -121,6 +127,11 @@ export function loadConfig(): AppConfig {
   const allowedHosts = [
     `127.0.0.1:${mcpPort}`,
     `localhost:${mcpPort}`,
+    // IPv6 loopback: a client connecting to http://[::1]:port sends the
+    // bracketed literal in the Host header, and the SDK's check is an exact
+    // string match — without this entry the documented MCP_HOST=::1 setup
+    // would 403 every request.
+    `[::1]:${mcpPort}`,
     ...(process.env.MCP_ALLOWED_HOSTS || "")
       .split(",")
       .map((h) => h.trim())
@@ -145,40 +156,142 @@ export function loadConfig(): AppConfig {
   }
 
   // CCU TLS verification (issue #51). A CCU ships a self-signed cert, so verify
-  // it either by pinning the leaf fingerprint (CCU_TLS_FINGERPRINT) or by
-  // trusting a CA/self-signed PEM (CCU_CA_CERT). Fingerprint takes precedence.
-  const tlsFingerprint = process.env.CCU_TLS_FINGERPRINT?.trim() || undefined;
-  const caCertPath = process.env.CCU_CA_CERT?.trim() || undefined;
-  let caCert: string | undefined;
-  if (caCertPath) {
+  // it either by pinning the leaf fingerprint or by trusting a CA/self-signed
+  // PEM. Read the PEM here; the env var name is only for the error message
+  // (don't interpolate the env-derived PATH into logs — js/clear-text-logging).
+  const readCaCert = (envName: string, path: string | undefined): string | undefined => {
+    if (!path) return undefined;
     try {
-      caCert = readFileSync(caCertPath, "utf-8");
+      return readFileSync(path, "utf-8");
     } catch (err) {
-      // Don't interpolate the env-derived path here: a fatal config error is
-      // logged at the top level, and echoing raw env values into logs is a
-      // leak vector (js/clear-text-logging). The fs error already names the
-      // path for the operator.
-      throw new Error(`CCU_CA_CERT could not be read: ${(err as Error).message}`);
+      throw new Error(`${envName} could not be read: ${(err as Error).message}`);
+    }
+  };
+
+  // Build one named profile from CCU_<PREFIX>_* env vars (issue #69). These are
+  // read DYNAMICALLY (template-literal keys), so the env-example-sync test's
+  // literal scan doesn't see them — intentional; they're documented as comments
+  // in .env.example. Password may be empty (OpenCCU dev boxes default to it).
+  const buildProfile = (name: string): CcuProfile => {
+    const p = name.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+    const get = (suffix: string): string | undefined => process.env[`CCU_${p}_${suffix}`]?.trim() || undefined;
+    const host = get("HOST");
+    if (!host) throw new Error(`profile "${name}" is missing CCU_${p}_HOST`);
+    const https = process.env[`CCU_${p}_HTTPS`] === "true";
+    return {
+      name,
+      protected: process.env[`CCU_${p}_PROTECTED`] === "true",
+      readonly: process.env[`CCU_${p}_READONLY`] === "true",
+      ccu: {
+        host,
+        port: parseIntEnv(`CCU_${p}_PORT`, https ? "443" : "80"),
+        https,
+        tlsVerify: process.env[`CCU_${p}_TLS_VERIFY`] === "true",
+        tlsFingerprint: get("TLS_FINGERPRINT"),
+        caCert: readCaCert(`CCU_${p}_CA_CERT`, get("CA_CERT")),
+        user: get("USER") || "Admin",
+        password: process.env[`CCU_${p}_PASSWORD`] ?? "",
+        timeout: parseIntEnv(`CCU_${p}_TIMEOUT`, "10000"),
+        scriptTimeout: parseIntEnv(`CCU_${p}_SCRIPT_TIMEOUT`, "30000"),
+      },
+    };
+  };
+
+  const profilesEnv = process.env.CCU_PROFILES?.trim();
+  let profiles: CcuProfile[];
+  let defaultProfile: string;
+
+  if (!profilesEnv) {
+    // Back-compat: no CCU_PROFILES ⇒ one "default" profile from the flat
+    // CCU_HOST/CCU_PASSWORD/... vars, with the exact validation as before.
+    // A leftover CCU_DEFAULT_PROFILE would be silently meaningless here — and
+    // writes would target the flat CCU_HOST box while the env file suggests a
+    // named profile — so fail loudly like every other config typo.
+    if (process.env.CCU_DEFAULT_PROFILE?.trim()) {
+      throw new Error(
+        "CCU_DEFAULT_PROFILE is set but CCU_PROFILES is not — either define CCU_PROFILES or remove CCU_DEFAULT_PROFILE",
+      );
+    }
+    const host = process.env.CCU_HOST;
+    if (!host) throw new Error("CCU_HOST environment variable is required");
+    const password = process.env.CCU_PASSWORD;
+    if (!password) throw new Error("CCU_PASSWORD environment variable is required");
+    profiles = [{
+      name: "default",
+      protected: false,
+      readonly: false,
+      ccu: {
+        host,
+        port: parseIntEnv("CCU_PORT", process.env.CCU_HTTPS === "true" ? "443" : "80"),
+        https: process.env.CCU_HTTPS === "true",
+        tlsVerify: process.env.CCU_TLS_VERIFY === "true",
+        tlsFingerprint: process.env.CCU_TLS_FINGERPRINT?.trim() || undefined,
+        caCert: readCaCert("CCU_CA_CERT", process.env.CCU_CA_CERT?.trim() || undefined),
+        user: process.env.CCU_USER || "Admin",
+        password,
+        timeout: parseIntEnv("CCU_TIMEOUT", "10000"),
+        scriptTimeout: parseIntEnv("CCU_SCRIPT_TIMEOUT", "30000"),
+      },
+    }];
+    defaultProfile = "default";
+  } else {
+    const names = profilesEnv.split(",").map((s) => s.trim()).filter(Boolean);
+    if (names.length === 0) throw new Error("CCU_PROFILES is set but lists no profile names");
+    const seen = new Set<string>();
+    // Distinct names can still collide on the sanitized env prefix
+    // ("prod-a" and "prod.a" both read CCU_PROD_A_*), which would silently
+    // configure two "different" targets from the same variables.
+    const seenPrefix = new Map<string, string>();
+    for (const n of names) {
+      const key = n.toLowerCase();
+      if (seen.has(key)) throw new Error(`CCU_PROFILES lists "${n}" more than once`);
+      seen.add(key);
+      const prefix = n.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+      const clash = seenPrefix.get(prefix);
+      if (clash) {
+        throw new Error(
+          `CCU_PROFILES names "${clash}" and "${n}" both map to the same env prefix CCU_${prefix}_* — rename one`,
+        );
+      }
+      seenPrefix.set(prefix, n);
+    }
+    profiles = names.map(buildProfile);
+    const requested = process.env.CCU_DEFAULT_PROFILE?.trim();
+    const match = requested
+      ? profiles.find((p) => p.name.toLowerCase() === requested.toLowerCase())
+      : profiles[0];
+    if (!match) {
+      throw new Error(`CCU_DEFAULT_PROFILE="${requested}" is not one of CCU_PROFILES (${names.join(", ")})`);
+    }
+    defaultProfile = match.name;
+  }
+
+  // TLS settings on a plain-HTTP target are a contradiction: the pinning /
+  // verification code path is only built for HTTPS, so the operator would
+  // believe the connection is verified while credentials travel in cleartext.
+  // Fail fast instead of silently ignoring the settings.
+  for (const p of profiles) {
+    if (!p.ccu.https && (p.ccu.tlsFingerprint || p.ccu.caCert || p.ccu.tlsVerify)) {
+      throw new Error(
+        `CCU profile "${p.name}": TLS_FINGERPRINT/CA_CERT/TLS_VERIFY is set but HTTPS is disabled — ` +
+        `these settings only apply over HTTPS. Set ${p.name === "default" ? "CCU_HTTPS" : `CCU_${p.name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_HTTPS`}=true or remove them.`,
+      );
     }
   }
 
+  const defaultCcu = profiles.find((p) => p.name === defaultProfile)!.ccu;
+
   return {
-    ccu: {
-      host,
-      port: parseIntEnv("CCU_PORT", process.env.CCU_HTTPS === "true" ? "443" : "80"),
-      https: process.env.CCU_HTTPS === "true",
-      tlsVerify: process.env.CCU_TLS_VERIFY === "true",
-      tlsFingerprint,
-      caCert,
-      user: process.env.CCU_USER || "Admin",
-      password,
-      timeout: parseIntEnv("CCU_TIMEOUT", "10000"),
-      scriptTimeout: parseIntEnv("CCU_SCRIPT_TIMEOUT", "30000"),
-    },
+    ccu: defaultCcu,
+    profiles,
+    defaultProfile,
     mcp: {
       transport,
       port: mcpPort,
-      authToken: process.env.MCP_AUTH_TOKEN,
+      // trim: a trailing space/CR (CRLF env file, quoted systemd Environment=)
+      // would otherwise be hashed into the expected token and 401 every client;
+      // MCP_AUTH_TOKEN_PREVIOUS and file-parsed tokens are already trimmed.
+      authToken: process.env.MCP_AUTH_TOKEN?.trim() || undefined,
       authTokenPrevious: process.env.MCP_AUTH_TOKEN_PREVIOUS?.trim() || undefined,
       authTokenTtlMs: parseDurationEnv("MCP_AUTH_TOKEN_TTL_DAYS", 86_400_000),
       authTokenGraceMs: parseDurationEnv("MCP_AUTH_TOKEN_GRACE_HOURS", 3_600_000) ?? 24 * 3_600_000,

@@ -3,7 +3,10 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ServerDeps } from "../server.js";
 import { CcuError } from "../middleware/error-mapper.js";
 import { withRetry } from "../middleware/retry.js";
-import { toolResult, structuredResult, tryParseJson, escapeHmScript, parseValue, parseValues } from "../utils.js";
+import { runTool } from "../middleware/tool-handler.js";
+import { resolveTarget } from "../ccu/target-registry.js";
+import { structuredResult, tryParseJson, escapeHmScript, parseValue, parseValues } from "../utils.js";
+import { targetField } from "./fields.js";
 
 export function registerReadTools(server: McpServer, deps: ServerDeps): void {
   registerGetValue(server, deps);
@@ -24,6 +27,7 @@ function registerGetValue(server: McpServer, deps: ServerDeps): void {
         address: z.string().describe("Channel address (e.g. '000A1BE9A71F15:1')"),
         valueKey: z.string().describe("Datapoint name (e.g. 'STATE', 'LEVEL', 'ACTUAL_TEMPERATURE')"),
         interface: z.string().optional().describe("Interface name override (auto-resolved if omitted)"),
+        target: targetField,
       },
       outputSchema: {
         address: z.string(),
@@ -32,32 +36,26 @@ function registerGetValue(server: McpServer, deps: ServerDeps): void {
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
+    async (args) => runTool("get_value", deps.logger, async (log) => {
+      const { rateLimiter, logger } = deps;
+      const { session, resolver } = resolveTarget(deps.selection, args.target);
+      const iface = args.interface ?? await resolver.resolveInterface(args.address, session, rateLimiter, logger);
 
-      try {
-        const iface = args.interface ?? await deps.resolver.resolveInterface(args.address, session, rateLimiter, logger);
+      await rateLimiter.acquire();
+      const value = await withRetry(
+        () => session.call("Interface.getValue", {
+          interface: iface,
+          address: args.address,
+          valueKey: args.valueKey,
+        }),
+        "Interface.getValue",
+        logger,
+        { rateLimiter },
+      );
 
-        await rateLimiter.acquire();
-        const value = await withRetry(
-          () => session.call("Interface.getValue", {
-            interface: iface,
-            address: args.address,
-            valueKey: args.valueKey,
-          }),
-          "Interface.getValue",
-          logger,
-        );
-
-        logger.info("tool_call", { tool: "get_value", duration_ms: Date.now() - start, status: "ok", address: args.address });
-        return structuredResult({ address: args.address, valueKey: args.valueKey, value: parseValue(value) });
-      } catch (err) {
-        logger.info("tool_call", { tool: "get_value", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
-      }
-    },
+      log({ address: args.address });
+      return structuredResult({ address: args.address, valueKey: args.valueKey, value: parseValue(value) });
+    }),
   );
 }
 
@@ -73,68 +71,91 @@ function registerGetValues(server: McpServer, deps: ServerDeps): void {
         channels: z.array(z.string()).optional().describe("Array of channel addresses to read"),
         room: z.string().optional().describe("Room name — read all channels in this room"),
         function: z.string().optional().describe("Function name — read all channels in this function group"),
+        target: targetField,
       },
       outputSchema: {
         values: z.array(z.unknown()).describe("One entry per channel: {address, name, datapoints}"),
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
+    async (args) => runTool("get_values", deps.logger, async () => {
+      const { rateLimiter, logger } = deps;
+      const t = resolveTarget(deps.selection, args.target);
+      const { session } = t;
+      // Build HM Script to collect values
+      let script: string;
 
-      try {
-        // Build HM Script to collect values
-        let script: string;
-
-        if (args.channels && args.channels.length > 0) {
-          // Comma-delimited with sentinel commas for exact matching via Find()
-          const addrList = "," + args.channels.map((a) => escapeHmScript(a)).join(",") + ",";
-          script = buildGetValuesScript(`"${addrList}"`, "addresses");
-        } else if (args.room) {
-          script = buildGetValuesScript(`"${escapeHmScript(args.room)}"`, "room");
-        } else if (args.function) {
-          script = buildGetValuesScript(`"${escapeHmScript(args.function)}"`, "function");
-        } else {
-          return {
-            isError: true,
-            content: [{ type: "text" as const, text: JSON.stringify({
-              error: "INVALID_INPUT",
-              message: "Provide either channels, room, or function parameter.",
-              hint: "At least one filter is required to avoid reading all devices.",
-            }) }],
-          };
-        }
-
-        await rateLimiter.acquire();
-        const result = await withRetry(
-          () => session.call("ReGa.runScript", { script }, deps.config.ccu.scriptTimeout),
-          "ReGa.runScript",
-          logger,
-        );
-
-        logger.info("tool_call", { tool: "get_values", duration_ms: Date.now() - start, status: "ok" });
-        const data = typeof result === "string" ? tryParseJson(result) : result;
-        // Wrap the array for structuredContent; keep the bare array as the text block.
-        return structuredResult({ values: Array.isArray(data) ? data : [] }, data);
-      } catch (err) {
-        logger.info("tool_call", { tool: "get_values", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
+      if (args.channels && args.channels.length > 0) {
+        // Comma-delimited with sentinel commas for exact matching via Find()
+        const addrList = "," + args.channels.map((a) => escapeHmScript(a)).join(",") + ",";
+        script = buildGetValuesScript(`"${addrList}"`, "addresses");
+      } else if (args.room) {
+        script = buildGetValuesScript(`"${escapeHmScript(args.room)}"`, "room");
+      } else if (args.function) {
+        script = buildGetValuesScript(`"${escapeHmScript(args.function)}"`, "function");
+      } else {
+        // Route through CcuError like every other tool (runTool maps it via
+        // toMcpError) instead of hand-building an isError result.
+        throw new CcuError({
+          error: "INVALID_INPUT",
+          code: 0,
+          message: "Provide either channels, room, or function parameter.",
+          hint: "At least one filter is required to avoid reading all devices.",
+        });
       }
-    },
+
+      await rateLimiter.acquire();
+      const result = await withRetry(
+        () => session.call("ReGa.runScript", { script }, t.profile.ccu.scriptTimeout),
+        "ReGa.runScript",
+        logger,
+        { rateLimiter },
+      );
+
+      const data = typeof result === "string" ? tryParseJson(result) : result;
+      // A non-array here means the ReGa script FAILED (runscript returns ""
+      // on any script error) or emitted broken JSON — answering with an empty
+      // success would be indistinguishable from "no matching channels".
+      if (!Array.isArray(data)) {
+        throw new CcuError({
+          error: "CCU_ERROR",
+          code: 0,
+          message: "The CCU script for get_values returned no parseable output",
+          hint: "The CCU's script engine failed (busy or errored). Try again; if it persists, check the CCU's ReGa state.",
+        });
+      }
+      // Parse each datapoint value to a native type, so a value read via the
+      // bulk get_values matches what the single get_value / get_paramset
+      // return (the HM-script emits every value as a quoted string for safe
+      // JSON; without this, STATE would be "true" here but boolean true there).
+      for (const entry of data) {
+        if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+          const dps = (entry as Record<string, unknown>).datapoints;
+          if (dps && typeof dps === "object" && !Array.isArray(dps)) {
+            (entry as Record<string, unknown>).datapoints = parseValues(dps as Record<string, unknown>);
+          }
+        }
+      }
+      // Wrap the array for structuredContent; keep the bare array as the text block.
+      return structuredResult({ values: data }, data);
+    }),
   );
 }
 
 // Helper HM Script fragment: write channel datapoints as JSON object
 // Quote all values as JSON strings for safety — empty values, special chars, enums all handled.
-// Names and values are JSON-escaped (backslash first, then quote) since channel names and
-// STRING datapoints are user-controlled; addresses and HssType are CCU identifiers and safe.
+// Names and values are JSON-escaped (backslash first, then quote, then the control
+// characters JSON forbids raw — tab/newline/CR reachable via user-renamed channels and
+// STRING datapoints) since both are user-controlled; addresses and HssType are CCU
+// identifiers and safe. The "\t"/"\n"/"\r" literals are real ReGa string escapes.
 const WRITE_CHANNEL_DPS = `
           if (!first) { Write(","); } first = false;
           string chNameEsc = ch.Name();
           chNameEsc = chNameEsc.Replace("\\\\", "\\\\\\\\");
           chNameEsc = chNameEsc.Replace("\\"", "\\\\\\"");
+          chNameEsc = chNameEsc.Replace("\\t", "\\\\t");
+          chNameEsc = chNameEsc.Replace("\\r", "\\\\r");
+          chNameEsc = chNameEsc.Replace("\\n", "\\\\n");
           Write('{"address":"' # ch.Address() # '","name":"' # chNameEsc # '","datapoints":{');
           boolean firstDp = true;
           string dpId;
@@ -145,6 +166,9 @@ const WRITE_CHANNEL_DPS = `
               string dpValEsc = "" # dp.Value();
               dpValEsc = dpValEsc.Replace("\\\\", "\\\\\\\\");
               dpValEsc = dpValEsc.Replace("\\"", "\\\\\\"");
+              dpValEsc = dpValEsc.Replace("\\t", "\\\\t");
+              dpValEsc = dpValEsc.Replace("\\r", "\\\\r");
+              dpValEsc = dpValEsc.Replace("\\n", "\\\\n");
               Write('"' # dp.HssType() # '":"' # dpValEsc # '"');
             }
           }
@@ -201,12 +225,14 @@ function registerGetParamset(server: McpServer, deps: ServerDeps): void {
     {
       title: "Get Paramset",
       description:
-        "Read all parameters for a channel (VALUES, MASTER, or LINK). " +
-        "Interface is auto-resolved from the address.",
+        "Read all parameters for a channel: VALUES (runtime state), MASTER (config), or a link " +
+        "paramset — for the latter pass the LINK PARTNER's channel address as paramsetKey " +
+        "(find partners with list_links). Interface is auto-resolved from the address.",
       inputSchema: {
         address: z.string().describe("Channel address (e.g. '000A1BE9A71F15:1')"),
-        paramsetKey: z.enum(["VALUES", "MASTER", "LINK"]).describe("Paramset to read"),
+        paramsetKey: z.string().describe("'VALUES', 'MASTER', or a link partner's channel address (reads that direct link's parameters)"),
         interface: z.string().optional().describe("Interface name override (auto-resolved if omitted)"),
+        target: targetField,
       },
       outputSchema: {
         address: z.string(),
@@ -215,36 +241,41 @@ function registerGetParamset(server: McpServer, deps: ServerDeps): void {
       },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async (args) => {
-      const { session, rateLimiter, logger } = deps;
-      const start = Date.now();
-
-      try {
-        const iface = args.interface ?? await deps.resolver.resolveInterface(args.address, session, rateLimiter, logger);
-
-        await rateLimiter.acquire();
-        const result = await withRetry(
-          () => session.call("Interface.getParamset", {
-            interface: iface,
-            address: args.address,
-            paramsetKey: args.paramsetKey,
-          }),
-          "Interface.getParamset",
-          logger,
-        );
-
-        logger.info("tool_call", { tool: "get_paramset", duration_ms: Date.now() - start, status: "ok" });
-        // Parse values to native types if result is a flat object
-        const params = (typeof result === "object" && result !== null && !Array.isArray(result))
-          ? parseValues(result as Record<string, unknown>)
-          : result;
-        return structuredResult({ address: args.address, paramsetKey: args.paramsetKey, params });
-      } catch (err) {
-        logger.info("tool_call", { tool: "get_paramset", duration_ms: Date.now() - start, status: "error" });
-        if (err instanceof CcuError) return err.toMcpError();
-        throw err;
+    async (args) => runTool("get_paramset", deps.logger, async () => {
+      const { rateLimiter, logger } = deps;
+      const { session, resolver } = resolveTarget(deps.selection, args.target);
+      // The XML-RPC layer accepts MASTER, VALUES, or a link PARTNER's channel
+      // address as the paramset key — the literal "LINK" is not a valid key
+      // (verified live: it fails 502 "unknown device or channel", which would
+      // surface as a misleading NOT_FOUND for a channel that exists).
+      if (args.paramsetKey.toUpperCase() === "LINK") {
+        throw new CcuError({
+          error: "INVALID_INPUT",
+          code: 0,
+          message: 'The literal "LINK" is not a valid paramset key on the CCU.',
+          hint: "To read a direct link's parameters, pass the LINK PARTNER's channel address as paramsetKey (find partners with list_links).",
+        });
       }
-    },
+      const iface = args.interface ?? await resolver.resolveInterface(args.address, session, rateLimiter, logger);
+
+      await rateLimiter.acquire();
+      const result = await withRetry(
+        () => session.call("Interface.getParamset", {
+          interface: iface,
+          address: args.address,
+          paramsetKey: args.paramsetKey,
+        }),
+        "Interface.getParamset",
+        logger,
+        { rateLimiter },
+      );
+
+      // Parse values to native types if result is a flat object
+      const params = (typeof result === "object" && result !== null && !Array.isArray(result))
+        ? parseValues(result as Record<string, unknown>)
+        : result;
+      return structuredResult({ address: args.address, paramsetKey: args.paramsetKey, params });
+    }),
   );
 }
 
