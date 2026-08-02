@@ -83,8 +83,17 @@ Use this if you want the server running independently — for example on a home 
 
 **1. Start the container:**
 
+A prebuilt multi-arch image (`linux/amd64` + `linux/arm64`) is published to GHCR
+— no build step, no clone:
+
 ```bash
-git clone https://github.com/claymore666/ccu-mcp.git && cd ccu-mcp
+docker pull ghcr.io/marcinn2/debmatic-mcp:latest
+```
+
+Or build it yourself from source:
+
+```bash
+git clone https://github.com/marcinn2/debmatic-mcp.git && cd debmatic-mcp
 docker build -t ccu-mcp .
 docker run -d \
   --name ccu-mcp \
